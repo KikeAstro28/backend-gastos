@@ -48,7 +48,8 @@ DEFAULT_CATEGORIES = [
     "Tabaco",
 ]
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
 security = HTTPBearer()
 
 # =========================
@@ -611,3 +612,7 @@ def change_password(
     db.add(user)
     db.commit()
     return {"ok": True}
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "backend-gastos"}

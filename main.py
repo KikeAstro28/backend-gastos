@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 from typing import List, Optional
+import os
+from urllib.parse import unquote
 
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,23 +17,23 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     UniqueConstraint,
+    text,
 )
-
-
-
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 from passlib.context import CryptContext
 from jose import jwt, JWTError
-from urllib.parse import unquote
-from sqlalchemy import Boolean
-from sqlalchemy import text
 
 # =========================
 # CONFIG
 # =========================
-DATABASE_URL = "sqlite:///./app.db"  # aquí se guarda tu BD (archivo app.db)
-SECRET_KEY = "CHANGE_ME_TO_SOMETHING_RANDOM_AND_LONG"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
+
+# Render a veces usa postgres:// y SQLAlchemy quiere postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+SECRET_KEY = os.getenv("SECRET_KEY", "s8d9f7sdf8s7df98s7df9sdf7sdf98s7df9s8df")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30  # 30 días
 
@@ -46,31 +48,71 @@ DEFAULT_CATEGORIES = [
     "Tabaco",
 ]
 
-
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
+# =========================
+# DATABASE
+# =========================
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False}  # sqlite
+    connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
 )
-def ensure_schema():
-    # Añade users.email si no existe (migración simple sin borrar BD)
-    with engine.begin() as conn:
-        cols = conn.execute(text("PRAGMA table_info(users);")).fetchall()
-        col_names = {row[1] for row in cols}  # row[1] = name
-
-        if "email" not in col_names:
-            conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR;"))
-
-ensure_schema()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# =========================
+# MIGRACIÓN SIMPLE (email)
+# =========================
+def ensure_schema():
+    with engine.begin() as conn:
+        dialect = engine.dialect.name
+
+        if dialect == "sqlite":
+            table = conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+            ).fetchone()
+            if not table:
+                return
+
+            cols = conn.execute(text("PRAGMA table_info(users)")).fetchall()
+            col_names = {row[1] for row in cols}
+            if "email" not in col_names:
+                conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR"))
+        else:
+            table_exists = conn.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = 'users'
+                    )
+                    """
+                )
+            ).scalar()
+
+            if not table_exists:
+                return
+
+            col_exists = conn.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='users' AND column_name='email'
+                    )
+                    """
+                )
+            ).scalar()
+
+            if not col_exists:
+                conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR"))
 
 # =========================
 # DB MODELS
+# =========================
+
 # =========================
 class User(Base):
     __tablename__ = "users"
@@ -110,7 +152,8 @@ class Category(Base):
     user = relationship("User")
 
 
-
+Base.metadata.create_all(bind=engine)
+ensure_schema()
 
 
 # =========================

@@ -291,12 +291,25 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[
+        "http://localhost",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8080",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+
+        # Tu backend (no es estrictamente necesario, pero no molesta)
+        "https://backend-gastos.onrender.com",
+
+        # ⬇️ AÑADE AQUÍ tu URL REAL del frontend cuando lo despliegues
+        # "https://frontend-gastos-xxxxx.onrender.com",
+        # "https://tuapp.netlify.app",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # =========================
 # AUTH

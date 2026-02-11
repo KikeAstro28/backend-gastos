@@ -26,6 +26,8 @@ from jose import jwt, JWTError
 
 from fastapi import UploadFile, File
 import re
+from parse_router import router as parse_router
+
 # =========================
 # CONFIG
 # =========================
@@ -308,6 +310,7 @@ def _simple_amount_guess(text: str):
 # APP
 # =========================
 app = FastAPI()
+app.include_router(parse_router)
 
 # CORS: para Flutter Web
 

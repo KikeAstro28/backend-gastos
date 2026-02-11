@@ -317,8 +317,8 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://funny-praline-825b00.netlify.app",   # <-- TU NETLIFY (cámbialo por el tuyo)
-        "https://backend-gastos-g560.onrender.com",   # opcional
+        "https://kikeastro28.github.io",            # ✅ GitHub Pages
+        "https://funny-praline-825b00.netlify.app", # (opcional) tu Netlify viejo
     ],
     allow_origin_regex=r"^http://localhost:\d+$|^http://127\.0\.0\.1:\d+$",
     allow_credentials=True,

@@ -675,7 +675,21 @@ def parse_text(
 @app.post("/parse/image", response_model=ParseResponse)
 async def parse_image(
     file: UploadFile = File(...),
-    user: User = Depends(get_current_user),  # si quieres que sea público, quita esta línea
+    user: User = Depends(get_current_user),
 ):
-    _ = await file.read()
-    return {"items": []}
+    content = await file.read()
+
+    # DEBUG: verifica que llegan bytes de verdad
+    if not content or len(content) < 10:
+        raise HTTPException(status_code=400, detail="Archivo vacío o no recibido")
+
+    item = ParsedExpenseItem(
+        date=_today_iso(),
+        description=f"Ticket: {file.filename}",
+        amount=1.23,
+        category="Compra/Supermercado",
+        extra="demo",
+        confidence=0.1,
+    )
+
+    return {"items": [item]}

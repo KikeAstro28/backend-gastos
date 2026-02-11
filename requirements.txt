@@ -6,3 +6,9 @@ python-jose
 pydantic
 psycopg2-binary
 python-multipart
+paddleocr==2.7.0.3
+paddlepaddle==2.6.2
+opencv-python-headless==4.10.0.84
+pillow==10.4.0
+numpy==1.26.4
+

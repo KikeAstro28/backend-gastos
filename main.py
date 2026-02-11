@@ -26,6 +26,9 @@ from jose import jwt, JWTError
 
 from fastapi import UploadFile, File
 import re
+import numpy as np
+import cv2
+from paddleocr import PaddleOCR
 
 
 # =========================
@@ -306,11 +309,121 @@ def _simple_amount_guess(text: str):
         return None
     return float(m.group(1).replace(",", "."))
 
+def _parse_rows_from_ocr(ocr_result, img_height: int):
+    """
+    ocr_result: salida de PaddleOCR. Agrupamos por coordenada Y para formar filas.
+    Esperamos filas tipo:
+    02/02/2026  Fibra casa  27  Suscripciones  Internet
+    """
+    items = []
+
+    if not ocr_result or not ocr_result[0]:
+        return items
+
+    blocks = []
+    for line in ocr_result[0]:
+        box = line[0]
+        text, conf = line[1]
+        text = (text or "").strip()
+        if not text:
+            continue
+
+        ys = [p[1] for p in box]
+        xs = [p[0] for p in box]
+        y_center = sum(ys) / len(ys)
+        x_center = sum(xs) / len(xs)
+
+        blocks.append((y_center, x_center, text, float(conf)))
+
+    blocks.sort(key=lambda t: (t[0], t[1]))
+
+    # y_tol adaptativo (funciona mejor si cambias resolución)
+    y_tol = max(10, int(img_height * 0.012))  # ~1.2% del alto
+
+    rows = []
+    current = []
+    last_y = None
+
+    for y, x, txt, conf in blocks:
+        if last_y is None or abs(y - last_y) <= y_tol:
+            current.append((x, txt, conf))
+            last_y = y if last_y is None else (last_y * 0.7 + y * 0.3)
+        else:
+            rows.append(sorted(current, key=lambda a: a[0]))
+            current = [(x, txt, conf)]
+            last_y = y
+
+    if current:
+        rows.append(sorted(current, key=lambda a: a[0]))
+
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    amount_re = re.compile(r"^\d+(?:[.,]\d+)?$")
+
+    for r in rows:
+        texts = [t[1] for t in r if t[1]]
+        if not texts:
+            continue
+
+        # Fecha en primera columna
+        if not date_re.match(texts[0]):
+            continue
+
+        date_str = texts[0]
+
+        # Buscar amount (evitar pillar el año)
+        amount = None
+        amount_idx = None
+        for i, s in enumerate(texts):
+            s2 = s.replace("€", "").strip()
+
+            if not amount_re.match(s2):
+                continue
+
+            # si es un entero de 4 dígitos tipo 2026 → NO
+            if s2.isdigit() and len(s2) == 4:
+                continue
+
+            # amounts típicos: 27, 10, 1,8, 38,57 etc.
+            if len(s2) <= 6 or ("," in s2 or "." in s2):
+                amount = float(s2.replace(",", "."))
+                amount_idx = i
+                break
+
+        # debe haber al menos una palabra de descripción
+        if amount is None or amount_idx is None or amount_idx < 2:
+            continue
+
+        description = " ".join(texts[1:amount_idx]).strip()
+        tail = texts[amount_idx + 1:]
+
+        category = tail[0].strip() if len(tail) >= 1 else DEFAULT_CATEGORIES[0]
+        extra = " ".join(tail[1:]).strip() if len(tail) >= 2 else ""
+
+        dd, mm, yyyy = date_str.split("/")
+        iso_date = f"{yyyy}-{mm}-{dd}T00:00:00"
+
+        conf_avg = sum(t[2] for t in r) / max(1, len(r))
+
+        items.append(
+            ParsedExpenseItem(
+                date=iso_date,
+                description=(description[:120] if description else "Gasto"),
+                amount=amount,
+                category=category[:64],
+                extra=extra[:120],
+                confidence=conf_avg,
+            )
+        )
+
+    return items
+
+
 # =========================
 # APP
 # =========================
 app = FastAPI()
 
+ocr = PaddleOCR(use_angle_cls=True, lang="en")  # para números/fechas suele ir bien
 
 # CORS: para Flutter Web
 
@@ -677,19 +790,21 @@ async def parse_image(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
 ):
-    content = await file.read()
-
-    # DEBUG: verifica que llegan bytes de verdad
-    if not content or len(content) < 10:
+    data = await file.read()
+    if not data or len(data) < 10:
         raise HTTPException(status_code=400, detail="Archivo vacío o no recibido")
 
-    item = ParsedExpenseItem(
-        date=_today_iso(),
-        description=f"Ticket: {file.filename}",
-        amount=1.23,
-        category="Compra/Supermercado",
-        extra="demo",
-        confidence=0.1,
-    )
+    # bytes -> imagen (opencv)
+    npimg = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen")
 
-    return {"items": [item]}
+    h, w = img.shape[:2]
+
+    # OCR
+    result = ocr.ocr(img, cls=True)
+
+    items = _parse_rows_from_ocr(result, img_height=h)
+
+    return {"items": items}

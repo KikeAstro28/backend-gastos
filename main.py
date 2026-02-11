@@ -24,6 +24,8 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 
+from fastapi import UploadFile, File
+import re
 # =========================
 # CONFIG
 # =========================
@@ -226,6 +228,19 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=4, max_length=128)
 
 
+class ParseTextRequest(BaseModel):
+    text: str = Field(min_length=1)
+
+class ParsedExpenseItem(BaseModel):
+    date: str
+    description: str
+    amount: float
+    category: str
+    extra: str = ""
+    confidence: float = 0.0
+
+class ParseResponse(BaseModel):
+    items: List[ParsedExpenseItem]
 # =========================
 # HELPERS
 # =========================
@@ -280,7 +295,14 @@ def expense_to_out(e: Expense) -> ExpenseOut:
     )
 
 
+def _today_iso():
+    return datetime.utcnow().isoformat()
 
+def _simple_amount_guess(text: str):
+    m = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€?", text)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", "."))
 
 # =========================
 # APP
@@ -620,3 +642,33 @@ def change_password(
 @app.get("/")
 def root():
     return {"status": "ok", "service": "backend-gastos"}
+
+
+@app.post("/parse/text", response_model=ParseResponse)
+def parse_text(
+    payload: ParseTextRequest,
+    user: User = Depends(get_current_user),  # si quieres que sea público, quita esta línea
+):
+    txt = payload.text.strip()
+    amount = _simple_amount_guess(txt)
+
+    if amount is None:
+        return {"items": []}
+
+    item = ParsedExpenseItem(
+        date=_today_iso(),
+        description=txt[:120],
+        amount=amount,
+        category=DEFAULT_CATEGORIES[0],
+        extra="",
+        confidence=0.3,
+    )
+    return {"items": [item]}
+
+@app.post("/parse/image", response_model=ParseResponse)
+async def parse_image(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),  # si quieres que sea público, quita esta línea
+):
+    _ = await file.read()
+    return {"items": []}

@@ -5,4 +5,4 @@ passlib
 python-jose
 pydantic
 psycopg2-binary
-	
+python-multipart

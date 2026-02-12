@@ -28,7 +28,6 @@ from fastapi import UploadFile, File
 import re
 import numpy as np
 import cv2
-from paddleocr import PaddleOCR
 
 
 # =========================
@@ -417,21 +416,24 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
     return items
 
+ocr = None
+
 def get_ocr():
     global ocr
     if ocr is None:
+        from paddleocr import PaddleOCR  # <-- import aquí (lazy)
         ocr = PaddleOCR(
-            use_angle_cls=False,   # ahorra memoria
+            use_angle_cls=False,
             lang="en",
-            show_log=False
+            show_log=False,
         )
     return ocr
+
 # =========================
 # APP
 # =========================
 app = FastAPI()
 
-ocr = None
 
 # CORS: para Flutter Web
 
@@ -808,12 +810,13 @@ async def parse_image(
     if img is None:
         raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen")
 
+h, w = img.shape[:2]
+
+max_w = 1280
+if w > max_w:
+    scale = max_w / w
+    img = cv2.resize(img, (int(w * scale), int(h * scale)))
     h, w = img.shape[:2]
 
-    # OCR
-    ocr_instance = get_ocr()
-    result = ocr_instance.ocr(img, cls=False)
-
-    items = _parse_rows_from_ocr(result, img_height=h)
-
-    return {"items": items}
+ocr_instance = get_ocr()
+result = ocr_instance.ocr(img, cls=False)

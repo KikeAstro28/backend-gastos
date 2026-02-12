@@ -421,7 +421,7 @@ ocr = None
 def get_ocr():
     global ocr
     if ocr is None:
-        from paddleocr import PaddleOCR  # <-- import aquí (lazy)
+
         ocr = PaddleOCR(
             use_angle_cls=False,
             lang="en",
@@ -817,6 +817,7 @@ if w > max_w:
     scale = max_w / w
     img = cv2.resize(img, (int(w * scale), int(h * scale)))
     h, w = img.shape[:2]
+
 
 ocr_instance = get_ocr()
 result = ocr_instance.ocr(img, cls=False)

@@ -29,6 +29,7 @@ import re
 import numpy as np
 import cv2
 
+from paddleocr import PaddleOCR  # <-- IMPORTANTE
 
 # =========================
 # CONFIG
@@ -418,16 +419,21 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
 ocr = None
 
+
+
+
+
 def get_ocr():
     global ocr
     if ocr is None:
-
         ocr = PaddleOCR(
-            use_angle_cls=False,
+            use_angle_cls=False,   # quitamos clasificador
             lang="en",
             show_log=False,
+            use_gpu=False
         )
     return ocr
+
 
 # =========================
 # APP
@@ -795,6 +801,8 @@ def parse_text(
     )
     return {"items": [item]}
 
+
+
 @app.post("/parse/image", response_model=ParseResponse)
 async def parse_image(
     file: UploadFile = File(...),
@@ -810,14 +818,18 @@ async def parse_image(
     if img is None:
         raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen")
 
-h, w = img.shape[:2]
-
-max_w = 1280
-if w > max_w:
-    scale = max_w / w
-    img = cv2.resize(img, (int(w * scale), int(h * scale)))
     h, w = img.shape[:2]
 
+    # opcional: bajar resolución si viene enorme
+    max_w = 1280
+    if w > max_w:
+        scale = max_w / w
+        img = cv2.resize(img, (int(w * scale), int(h * scale)))
+        h, w = img.shape[:2]
 
-ocr_instance = get_ocr()
-result = ocr_instance.ocr(img, cls=False)
+    ocr_instance = get_ocr()
+    result = ocr_instance.ocr(img, cls=False)
+
+    items = _parse_rows_from_ocr(result, img_height=h)
+
+    return ParseResponse(items=items)

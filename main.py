@@ -1,3 +1,10 @@
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+
 from datetime import datetime, timedelta
 from typing import List, Optional
 import os
@@ -29,7 +36,8 @@ import re
 import numpy as np
 import cv2
 
-from paddleocr import PaddleOCR  # <-- IMPORTANTE
+
+from fastapi import Response
 
 # =========================
 # CONFIG
@@ -426,6 +434,7 @@ ocr = None
 def get_ocr():
     global ocr
     if ocr is None:
+        from paddleocr import PaddleOCR  # <-- IMPORTANTE
         ocr = PaddleOCR(
             use_angle_cls=False,   # quitamos clasificador
             lang="en",
@@ -833,3 +842,8 @@ async def parse_image(
     items = _parse_rows_from_ocr(result, img_height=h)
 
     return ParseResponse(items=items)
+
+
+@app.head("/")
+def root_head():
+    return Response(status_code=200)

@@ -417,13 +417,21 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
     return items
 
-
+def get_ocr():
+    global ocr
+    if ocr is None:
+        ocr = PaddleOCR(
+            use_angle_cls=False,   # ahorra memoria
+            lang="en",
+            show_log=False
+        )
+    return ocr
 # =========================
 # APP
 # =========================
 app = FastAPI()
 
-ocr = PaddleOCR(use_angle_cls=True, lang="en")  # para números/fechas suele ir bien
+ocr = None
 
 # CORS: para Flutter Web
 
@@ -803,7 +811,8 @@ async def parse_image(
     h, w = img.shape[:2]
 
     # OCR
-    result = ocr.ocr(img, cls=True)
+    ocr_instance = get_ocr()
+    result = ocr_instance.ocr(img, cls=False)
 
     items = _parse_rows_from_ocr(result, img_height=h)
 

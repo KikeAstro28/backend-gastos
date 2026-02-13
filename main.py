@@ -1,4 +1,7 @@
 import os
+
+os.environ["PADDLEOCR_HOME"] = "/var/paddleocr"
+os.environ["PADDLEOCR_HOME"] = "/tmp/paddleocr"   # o mejor un disco persistente
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -451,6 +454,14 @@ app = FastAPI()
 
 
 # CORS: para Flutter Web
+@app.on_event("startup")
+def warmup():
+    try:
+        get_ocr()  # fuerza descarga/initialización al arrancar
+        print("✅ OCR listo")
+    except Exception as e:
+        print("❌ OCR warmup falló:", e)
+
 
 app.add_middleware(
     CORSMiddleware,

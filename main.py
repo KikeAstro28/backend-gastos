@@ -1,4 +1,21 @@
 import os
+import threading
+
+# Intentar usar disco persistente si existe, si no /tmp
+PERSIST_DIR = os.getenv("PERSIST_DIR", "/var/data")
+if not os.path.isdir(PERSIST_DIR) or not os.access(PERSIST_DIR, os.W_OK):
+    PERSIST_DIR = "/tmp"
+
+os.environ["HOME"] = PERSIST_DIR
+os.environ["XDG_CACHE_HOME"] = os.path.join(PERSIST_DIR, ".cache")
+os.environ["PADDLEOCR_HOME"] = os.path.join(PERSIST_DIR, ".paddleocr")
+
+# Limitar hilos para que Render no te mate el proceso
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import re
 import threading
 from datetime import datetime, timedelta
@@ -449,12 +466,50 @@ def get_ocr():
             ocr_ready = False
             print("❌ OCR init falló:", repr(e))
             raise
+ocr = None
+ocr_lock = threading.Lock()
+ocr_status = {"state": "cold", "error": None}  # cold | loading | ready | failed
+
+def _init_ocr_blocking():
+    global ocr
+    try:
+        from paddleocr import PaddleOCR
+        ocr = PaddleOCR(
+            use_angle_cls=False,
+            lang="en",
+            show_log=False,
+            use_gpu=False,
+        )
+        ocr_status["state"] = "ready"
+        ocr_status["error"] = None
+        print("✅ OCR listo")
+    except Exception as e:
+        ocr_status["state"] = "failed"
+        ocr_status["error"] = repr(e)
+        print("❌ OCR init falló:", repr(e))
+
+def ensure_ocr_background():
+    # Si ya está listo o cargando, no hacer nada
+    if ocr_status["state"] in ("loading", "ready"):
+        return
+    with ocr_lock:
+        if ocr_status["state"] in ("loading", "ready"):
+            return
+        ocr_status["state"] = "loading"
+        t = threading.Thread(target=_init_ocr_blocking, daemon=True)
+        t.start()
 
 
 # =========================
 # APP
 # =========================
 app = FastAPI()
+
+@app.on_event("startup")
+def startup_event():
+    # Arranca la descarga/init en background
+    ensure_ocr_background()
+
 
 
 @app.on_event("startup")
@@ -774,10 +829,21 @@ def parse_text(payload: ParseTextRequest, user: User = Depends(get_current_user)
 
 
 @app.post("/parse/image", response_model=ParseResponse)
-async def parse_image(file: UploadFile = File(...), user: User = Depends(get_current_user)):
+async def parse_image(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
     data = await file.read()
     if not data or len(data) < 10:
         raise HTTPException(status_code=400, detail="Archivo vacío o no recibido")
+
+    # Si OCR aún no está listo, no bloquees la request -> 503
+    if ocr_status["state"] != "ready":
+        ensure_ocr_background()
+        raise HTTPException(
+            status_code=503,
+            detail="OCR calentando/descargando modelos. Reintenta en 20-30s."
+        )
 
     npimg = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
@@ -791,16 +857,10 @@ async def parse_image(file: UploadFile = File(...), user: User = Depends(get_cur
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
         h, w = img.shape[:2]
 
-    # Si OCR aún no está listo => 503 (frontend lo puede reintentar)
-    try:
-        ocr_instance = get_ocr()
-    except Exception:
-        raise HTTPException(status_code=503, detail="OCR no disponible (init falló). Reintenta en 30s.")
-
-    result = ocr_instance.ocr(img, cls=False)
+    # Ejecutar OCR
+    result = ocr.ocr(img, cls=False)
     items = _parse_rows_from_ocr(result, img_height=h)
     return ParseResponse(items=items)
-
 
 @app.get("/")
 def root():

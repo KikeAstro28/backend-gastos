@@ -1,17 +1,17 @@
 import os
 
-# =========================
-# OCR / PERFORMANCE ENV (ANTES de importar paddle/paddleocr)
-# =========================
-# Si tienes disco persistente en Render -> /var/paddleocr
-# Si no -> /tmp/paddleocr (se borra en reinicios)
-os.environ.setdefault("PADDLEOCR_HOME", "/tmp/paddleocr")
+# En Render con disco persistente montado en /var/data
+PERSIST_DIR = os.getenv("PERSIST_DIR", "/var/data")
 
-# Limitar hilos para no reventar CPU/RAM en Render
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ["HOME"] = PERSIST_DIR
+os.environ["XDG_CACHE_HOME"] = os.path.join(PERSIST_DIR, ".cache")
+os.environ["PADDLEOCR_HOME"] = os.path.join(PERSIST_DIR, "paddleocr")
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -445,10 +445,18 @@ def get_ocr():
 # =========================
 app = FastAPI()
 
-# IMPORTANTE: elimina warmup. Si lo haces en startup, Render puede matarte.
-# @app.on_event("startup")
-# def warmup():
-#     get_ocr()
+from threading import Thread
+
+@app.on_event("startup")
+def warmup():
+    def _bg():
+        try:
+            get_ocr()
+            print("✅ OCR listo")
+        except Exception as e:
+            print("❌ OCR warmup falló:", e)
+
+    Thread(target=_bg, daemon=True).start()
 
 app.add_middleware(
     CORSMiddleware,

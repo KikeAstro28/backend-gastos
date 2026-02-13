@@ -1,21 +1,26 @@
-# =========================
-# ENV (DEBE IR LO PRIMERO)
-# =========================
 import os
 
-# Carpeta donde PaddleOCR guarda modelos (en Render /tmp suele ser escribible)
-os.environ["PADDLEOCR_HOME"] = os.getenv("PADDLEOCR_HOME", "/tmp/paddleocr")
+# =========================
+# OCR / PERFORMANCE ENV (ANTES de importar paddle/paddleocr)
+# =========================
+# Si tienes disco persistente en Render -> /var/paddleocr
+# Si no -> /tmp/paddleocr (se borra en reinicios)
+os.environ.setdefault("PADDLEOCR_HOME", "/tmp/paddleocr")
 
-# Limitar threads para que Render no se ahogue
-os.environ["OMP_NUM_THREADS"] = os.getenv("OMP_NUM_THREADS", "1")
-os.environ["OPENBLAS_NUM_THREADS"] = os.getenv("OPENBLAS_NUM_THREADS", "1")
-os.environ["MKL_NUM_THREADS"] = os.getenv("MKL_NUM_THREADS", "1")
-os.environ["NUMEXPR_NUM_THREADS"] = os.getenv("NUMEXPR_NUM_THREADS", "1")
-
+# Limitar hilos para no reventar CPU/RAM en Render
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from datetime import datetime, timedelta
 from typing import List, Optional
 from urllib.parse import unquote
+import re
+import threading
+
+import numpy as np
+import cv2
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,17 +43,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 
-import re
-import numpy as np
-import cv2
-
 
 # =========================
 # CONFIG
 # =========================
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
-
-# Render a veces usa postgres:// y SQLAlchemy quiere postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -77,7 +76,6 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {},
 )
-
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -137,7 +135,6 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     nickname = Column(String, unique=True, nullable=False, index=True)
     hashed_password = Column(String, nullable=False)
-
     email = Column(String, nullable=True, unique=False)
 
     expenses = relationship("Expense", back_populates="user", cascade="all, delete-orphan")
@@ -147,7 +144,6 @@ class Expense(Base):
     __tablename__ = "expenses"
 
     id = Column(Integer, primary_key=True, index=True)
-
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     user = relationship("User", back_populates="expenses")
 
@@ -182,7 +178,6 @@ class HiddenCategory(Base):
 
 Base.metadata.create_all(bind=engine)
 ensure_schema()
-Base.metadata.create_all(bind=engine)
 
 # =========================
 # Pydantic Schemas
@@ -203,7 +198,7 @@ class TokenResponse(BaseModel):
 
 
 class ExpenseIn(BaseModel):
-    date: Optional[str] = None  # ISO string
+    date: Optional[str] = None
     description: str
     amount: float
     category: str
@@ -329,7 +324,6 @@ def _simple_amount_guess(text: str):
 
 def _parse_rows_from_ocr(ocr_result, img_height: int):
     items = []
-
     if not ocr_result or not ocr_result[0]:
         return items
 
@@ -340,22 +334,18 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
         text = (text or "").strip()
         if not text:
             continue
-
         ys = [p[1] for p in box]
         xs = [p[0] for p in box]
         y_center = sum(ys) / len(ys)
         x_center = sum(xs) / len(xs)
-
         blocks.append((y_center, x_center, text, float(conf)))
 
     blocks.sort(key=lambda t: (t[0], t[1]))
-
-    y_tol = max(10, int(img_height * 0.012))  # ~1.2% del alto
+    y_tol = max(10, int(img_height * 0.012))
 
     rows = []
     current = []
     last_y = None
-
     for y, x, txt, conf in blocks:
         if last_y is None or abs(y - last_y) <= y_tol:
             current.append((x, txt, conf))
@@ -364,7 +354,6 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
             rows.append(sorted(current, key=lambda a: a[0]))
             current = [(x, txt, conf)]
             last_y = y
-
     if current:
         rows.append(sorted(current, key=lambda a: a[0]))
 
@@ -375,7 +364,6 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
         texts = [t[1] for t in r if t[1]]
         if not texts:
             continue
-
         if not date_re.match(texts[0]):
             continue
 
@@ -385,13 +373,10 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
         amount_idx = None
         for i, s in enumerate(texts):
             s2 = s.replace("€", "").strip()
-
             if not amount_re.match(s2):
                 continue
-
             if s2.isdigit() and len(s2) == 4:
                 continue
-
             if len(s2) <= 6 or ("," in s2 or "." in s2):
                 amount = float(s2.replace(",", "."))
                 amount_idx = i
@@ -426,34 +411,33 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
 
 # =========================
-# OCR SINGLETON (clave)
+# OCR (lazy + lock)
 # =========================
 ocr = None
-ocr_ready = False
-
-def init_ocr():
-    """Inicializa OCR una vez (en startup)."""
-    global ocr, ocr_ready
-    if ocr_ready and ocr is not None:
-        return
-
-    from paddleocr import PaddleOCR
-
-    ocr = PaddleOCR(
-        use_angle_cls=False,
-        lang="en",
-        show_log=False,
-        use_gpu=False,
-    )
-    ocr_ready = True
-
+ocr_lock = threading.Lock()
 
 def get_ocr():
-    """Devuelve OCR ya inicializado."""
-    global ocr, ocr_ready
-    if not ocr_ready or ocr is None:
-        raise HTTPException(status_code=503, detail="OCR aún no está listo. Reintenta en unos segundos.")
-    return ocr
+    global ocr
+    if ocr is not None:
+        return ocr
+
+    with ocr_lock:
+        if ocr is not None:
+            return ocr
+
+        try:
+            from paddleocr import PaddleOCR
+            ocr = PaddleOCR(
+                use_angle_cls=False,
+                lang="en",
+                show_log=False,
+                use_gpu=False,
+            )
+            print("✅ OCR inicializado")
+            return ocr
+        except Exception as e:
+            print("❌ OCR init falló:", repr(e))
+            raise
 
 
 # =========================
@@ -461,18 +445,10 @@ def get_ocr():
 # =========================
 app = FastAPI()
 
-
-@app.on_event("startup")
-def warmup():
-    # fuerza descarga/initialización al arrancar
-    try:
-        init_ocr()
-        print("✅ OCR listo (warmup)")
-        print("PADDLEOCR_HOME =", os.environ.get("PADDLEOCR_HOME"))
-    except Exception as e:
-        # No rompemos el servidor entero: pero avisamos en logs
-        print("❌ OCR warmup falló:", repr(e))
-
+# IMPORTANTE: elimina warmup. Si lo haces en startup, Render puede matarte.
+# @app.on_event("startup")
+# def warmup():
+#     get_ocr()
 
 app.add_middleware(
     CORSMiddleware,
@@ -489,7 +465,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # =========================
 # AUTH
 # =========================
@@ -499,10 +474,7 @@ def register(data: RegisterRequest, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Nickname already exists")
 
-    user = User(
-        nickname=data.nickname,
-        hashed_password=hash_password(data.password),
-    )
+    user = User(nickname=data.nickname, hashed_password=hash_password(data.password))
     db.add(user)
     db.commit()
     db.refresh(user)
@@ -520,13 +492,10 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
 
 
 # =========================
-# CATEGORIES / EXPENSES
+# CATEGORIES
 # =========================
 @app.get("/categories", response_model=List[str])
-def list_categories(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def list_categories(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     rows = db.query(Category).filter(Category.user_id == user.id).order_by(Category.name.asc()).all()
     custom = [r.name for r in rows]
 
@@ -550,11 +519,7 @@ def list_categories(
 
 
 @app.post("/categories")
-def add_category(
-    payload: CategoryIn,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def add_category(payload: CategoryIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Empty category")
@@ -573,79 +538,8 @@ def add_category(
     return {"ok": True}
 
 
-@app.get("/expenses", response_model=List[ExpenseOut])
-def list_expenses(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    items = (
-        db.query(Expense)
-        .filter(Expense.user_id == user.id)
-        .order_by(Expense.date.desc())
-        .all()
-    )
-    return [expense_to_out(e) for e in items]
-
-
-@app.post("/expenses", response_model=ExpenseOut)
-def add_expense(
-    payload: ExpenseIn,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    dt = datetime.utcnow()
-    if payload.date:
-        dt = datetime.fromisoformat(payload.date)
-
-    e = Expense(
-        user_id=user.id,
-        date=dt,
-        description=payload.description,
-        amount=float(payload.amount),
-        category=payload.category,
-        extra=payload.extra or "",
-    )
-    db.add(e)
-    db.commit()
-    db.refresh(e)
-    return expense_to_out(e)
-
-
-@app.post("/expenses/bulk", response_model=List[ExpenseOut])
-def add_expenses_bulk(
-    payload: List[ExpenseIn],
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    out = []
-    for p in payload:
-        dt = datetime.utcnow()
-        if p.date:
-            dt = datetime.fromisoformat(p.date)
-
-        e = Expense(
-            user_id=user.id,
-            date=dt,
-            description=p.description,
-            amount=float(p.amount),
-            category=p.category,
-            extra=p.extra or "",
-        )
-        db.add(e)
-        out.append(e)
-
-    db.commit()
-    for e in out:
-        db.refresh(e)
-    return [expense_to_out(e) for e in out]
-
-
 @app.delete("/categories/{name}")
-def delete_category(
-    name: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def delete_category(name: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     name = unquote(name).strip()
     if not name:
         raise HTTPException(status_code=400, detail="Empty category")
@@ -668,11 +562,7 @@ def delete_category(
 
 
 @app.post("/categories/hide")
-def hide_category(
-    payload: CategoryIn,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def hide_category(payload: CategoryIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Empty category")
@@ -692,11 +582,7 @@ def hide_category(
 
 
 @app.post("/categories/unhide")
-def unhide_category(
-    payload: CategoryIn,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def unhide_category(payload: CategoryIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Empty category")
@@ -715,13 +601,66 @@ def unhide_category(
     return {"ok": True}
 
 
+# =========================
+# EXPENSES
+# =========================
+@app.get("/expenses", response_model=List[ExpenseOut])
+def list_expenses(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    items = (
+        db.query(Expense)
+        .filter(Expense.user_id == user.id)
+        .order_by(Expense.date.desc())
+        .all()
+    )
+    return [expense_to_out(e) for e in items]
+
+
+@app.post("/expenses", response_model=ExpenseOut)
+def add_expense(payload: ExpenseIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    dt = datetime.utcnow()
+    if payload.date:
+        dt = datetime.fromisoformat(payload.date)
+
+    e = Expense(
+        user_id=user.id,
+        date=dt,
+        description=payload.description,
+        amount=float(payload.amount),
+        category=payload.category,
+        extra=payload.extra or "",
+    )
+    db.add(e)
+    db.commit()
+    db.refresh(e)
+    return expense_to_out(e)
+
+
+@app.post("/expenses/bulk", response_model=List[ExpenseOut])
+def add_expenses_bulk(payload: List[ExpenseIn], user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    out = []
+    for p in payload:
+        dt = datetime.utcnow()
+        if p.date:
+            dt = datetime.fromisoformat(p.date)
+        e = Expense(
+            user_id=user.id,
+            date=dt,
+            description=p.description,
+            amount=float(p.amount),
+            category=p.category,
+            extra=p.extra or "",
+        )
+        db.add(e)
+        out.append(e)
+
+    db.commit()
+    for e in out:
+        db.refresh(e)
+    return [expense_to_out(e) for e in out]
+
+
 @app.put("/expenses/{expense_id}", response_model=ExpenseOut)
-def update_expense(
-    expense_id: int,
-    payload: ExpenseUpdate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def update_expense(expense_id: int, payload: ExpenseUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     e = (
         db.query(Expense)
         .filter(Expense.id == expense_id)
@@ -748,11 +687,7 @@ def update_expense(
 
 
 @app.delete("/expenses/{expense_id}")
-def delete_expense(
-    expense_id: int,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def delete_expense(expense_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     e = (
         db.query(Expense)
         .filter(Expense.id == expense_id)
@@ -767,21 +702,19 @@ def delete_expense(
     return {"ok": True}
 
 
+# =========================
+# ME
+# =========================
 @app.get("/me", response_model=MeResponse)
 def me(user: User = Depends(get_current_user)):
     return MeResponse(nickname=user.nickname, email=user.email)
 
 
 @app.post("/me/email")
-def update_email(
-    payload: UpdateEmailRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def update_email(payload: UpdateEmailRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     email = payload.email.strip()
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail="Invalid email")
-
     user.email = email
     db.add(user)
     db.commit()
@@ -789,41 +722,22 @@ def update_email(
 
 
 @app.post("/me/change-password")
-def change_password(
-    payload: ChangePasswordRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def change_password(payload: ChangePasswordRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not verify_password(payload.current_password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Current password incorrect")
-
     user.hashed_password = hash_password(payload.new_password)
     db.add(user)
     db.commit()
     return {"ok": True}
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "backend-gastos"}
-
-
-@app.head("/")
-def root_head():
-    return Response(status_code=200)
-
-
 # =========================
-# PARSERS
+# PARSE
 # =========================
 @app.post("/parse/text", response_model=ParseResponse)
-def parse_text(
-    payload: ParseTextRequest,
-    user: User = Depends(get_current_user),
-):
+def parse_text(payload: ParseTextRequest, user: User = Depends(get_current_user)):
     txt = payload.text.strip()
     amount = _simple_amount_guess(txt)
-
     if amount is None:
         return {"items": []}
 
@@ -839,10 +753,7 @@ def parse_text(
 
 
 @app.post("/parse/image", response_model=ParseResponse)
-async def parse_image(
-    file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
-):
+async def parse_image(file: UploadFile = File(...), user: User = Depends(get_current_user)):
     data = await file.read()
     if not data or len(data) < 10:
         raise HTTPException(status_code=400, detail="Archivo vacío o no recibido")
@@ -853,15 +764,28 @@ async def parse_image(
         raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen")
 
     h, w = img.shape[:2]
-
     max_w = 1280
     if w > max_w:
         scale = max_w / w
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
         h, w = img.shape[:2]
 
-    ocr_instance = get_ocr()  # aquí ya debe estar listo, o devuelve 503
-    result = ocr_instance.ocr(img, cls=False)
+    # OCR lazy init (y si falla, devolvemos 503)
+    try:
+        ocr_instance = get_ocr()
+    except Exception:
+        raise HTTPException(status_code=503, detail="OCR no disponible (init falló). Reintenta en 30s.")
 
+    result = ocr_instance.ocr(img, cls=False)
     items = _parse_rows_from_ocr(result, img_height=h)
     return ParseResponse(items=items)
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "backend-gastos"}
+
+
+@app.head("/")
+def root_head():
+    return Response(status_code=200)

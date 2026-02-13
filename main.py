@@ -511,19 +511,6 @@ ocr_init_error = None
 # =========================
 app = FastAPI()
 
-@app.on_event("startup")
-def _init_ocr():
-    global ocr, ocr_init_error
-    try:
-        from paddleocr import PaddleOCR
-        # Importante: instanciar UNA vez, y sin show_log para no petar logs
-        ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
-        ocr_init_error = None
-        print("✅ PaddleOCR inicializado")
-    except Exception as e:
-        ocr = None
-        ocr_init_error = repr(e)
-        print("❌ OCR init falló:", ocr_init_error)
 
 
 
@@ -849,38 +836,8 @@ async def parse_image(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
 ):
-    # Si OCR no está listo, devolvemos 503 con info (no NetworkError misterioso)
-    if ocr is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"OCR not available. init_error={ocr_init_error}",
-        )
-
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    # PaddleOCR suele ir mejor con ruta de fichero que con bytes directos
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        result = ocr.ocr(tmp_path, cls=True)
-
-        # De momento devolvemos vacío (tu lógica de parseo ya la metemos luego)
-        return {"items": []}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR failed: {repr(e)}")
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except:
-                pass
+    _ = await file.read()
+    return {"items": []}
 
 
 @app.get("/")

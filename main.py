@@ -1,35 +1,17 @@
 import os
-import threading
-
-# Intentar usar disco persistente si existe, si no /tmp
-PERSIST_DIR = os.getenv("PERSIST_DIR", "/var/data")
-if not os.path.isdir(PERSIST_DIR) or not os.access(PERSIST_DIR, os.W_OK):
-    PERSIST_DIR = "/tmp"
-
-os.environ["HOME"] = PERSIST_DIR
-os.environ["XDG_CACHE_HOME"] = os.path.join(PERSIST_DIR, ".cache")
-os.environ["PADDLEOCR_HOME"] = os.path.join(PERSIST_DIR, ".paddleocr")
-
-# Limitar hilos para que Render no te mate el proceso
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
 import re
 import threading
 from datetime import datetime, timedelta
+from functools import lru_cache
 from typing import List, Optional
 from urllib.parse import unquote
-
-import numpy as np
-import cv2
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import jwt, JWTError
+from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-
 from sqlalchemy import (
     create_engine,
     Column,
@@ -43,26 +25,31 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
-from passlib.context import CryptContext
-from jose import jwt, JWTError
-import tempfile
-
 # ============================================================
-# ✅ CAMBIO 1: Forzar cache/modelos OCR a /tmp (siempre escribible)
+# ✅ CAMBIO CLAVE: NO inicializar OCR en startup/import
+# - Render te mata el proceso (SIGTERM) por RAM/tiempo al cargar PaddleOCR
+# - Además PaddleOCR descarga modelos en runtime => rompe requests (login, etc.)
+# - Solución: OCR totalmente "lazy" y desactivable por ENV: ENABLE_OCR=0/1
 # ============================================================
-# En Render /var/data a veces da PermissionError (como te ha pasado).
-# /tmp SIEMPRE suele ser escribible.
-OCR_HOME = os.getenv("OCR_HOME", "/tmp")
-os.environ["HOME"] = OCR_HOME
-os.environ["XDG_CACHE_HOME"] = os.path.join(OCR_HOME, ".cache")
-os.environ["PADDLEOCR_HOME"] = os.path.join(OCR_HOME, ".paddleocr")
 
-# Reducir hilos para evitar que Render mate el proceso (SIGTERM)
+# Cache dirs siempre escribibles
+PERSIST_DIR = os.getenv("PERSIST_DIR", "/tmp")
+if not os.path.isdir(PERSIST_DIR) or not os.access(PERSIST_DIR, os.W_OK):
+    PERSIST_DIR = "/tmp"
+
+os.environ["HOME"] = PERSIST_DIR
+os.environ["XDG_CACHE_HOME"] = os.path.join(PERSIST_DIR, ".cache")
+os.environ["PADDLEOCR_HOME"] = os.path.join(PERSIST_DIR, ".paddleocr")
+
+# Limitar hilos para que Render no te mate el proceso
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
+# Flag para activar/desactivar OCR (en Render pon ENABLE_OCR=0 para estabilidad)
+ENABLE_OCR = os.getenv("ENABLE_OCR", "0") == "1"
+OCR_LANG = os.getenv("OCR_LANG", "en")
 
 # =========================
 # CONFIG
@@ -200,7 +187,6 @@ class HiddenCategory(Base):
 
 Base.metadata.create_all(bind=engine)
 ensure_schema()
-
 
 # =========================
 # Pydantic Schemas
@@ -434,100 +420,28 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
 
 # ============================================================
-# ✅ CAMBIO 2: OCR Lazy + Lock + Warmup en background (sin bloquear)
+# ✅ OCR LAZY (NO startup, NO warmup)
+# - Import de PaddleOCR solo si ENABLE_OCR=1
+# - Cachea el objeto OCR una vez
 # ============================================================
-ocr = None
-ocr_lock = threading.Lock()
-ocr_ready = False
-
-
+@lru_cache(maxsize=1)
 def get_ocr():
-    global ocr, ocr_ready
-    if ocr is not None and ocr_ready:
-        return ocr
+    if not ENABLE_OCR:
+        return None
+    # Import aquí dentro: si OCR está off, nunca importa ni descarga modelos
+    from paddleocr import PaddleOCR
+    return PaddleOCR(
+        use_angle_cls=False,
+        lang=OCR_LANG,
+        show_log=False,
+        use_gpu=False,
+    )
 
-    with ocr_lock:
-        if ocr is not None and ocr_ready:
-            return ocr
-
-        try:
-            from paddleocr import PaddleOCR
-
-            ocr = PaddleOCR(
-                use_angle_cls=False,
-                lang="en",
-                show_log=False,
-                use_gpu=False,
-            )
-            ocr_ready = True
-            print("✅ OCR inicializado")
-            return ocr
-        except Exception as e:
-            ocr_ready = False
-            print("❌ OCR init falló:", repr(e))
-            raise
-ocr = None
-ocr_lock = threading.Lock()
-ocr_status = {"state": "cold", "error": None}  # cold | loading | ready | failed
-
-def _init_ocr_blocking():
-    global ocr
-    try:
-        from paddleocr import PaddleOCR
-        ocr = PaddleOCR(
-            use_angle_cls=False,
-            lang="en",
-            show_log=False,
-            use_gpu=False,
-        )
-        ocr_status["state"] = "ready"
-        ocr_status["error"] = None
-        print("✅ OCR listo")
-    except Exception as e:
-        ocr_status["state"] = "failed"
-        ocr_status["error"] = repr(e)
-        print("❌ OCR init falló:", repr(e))
-
-def ensure_ocr_background():
-    # Si ya está listo o cargando, no hacer nada
-    if ocr_status["state"] in ("loading", "ready"):
-        return
-    with ocr_lock:
-        if ocr_status["state"] in ("loading", "ready"):
-            return
-        ocr_status["state"] = "loading"
-        t = threading.Thread(target=_init_ocr_blocking, daemon=True)
-        t.start()
-
-PADDLE_HOME = os.getenv("PADDLEOCR_HOME", "/tmp/paddleocr")
-os.environ["PADDLEOCR_HOME"] = PADDLE_HOME
-os.makedirs(PADDLE_HOME, exist_ok=True)
-
-ocr = None
-ocr_init_error = None
 
 # =========================
 # APP
 # =========================
 app = FastAPI()
-
-
-
-
-
-@app.on_event("startup")
-def warmup():
-    # Warmup en background: Render no se queda colgado y no mata el proceso.
-    def _bg():
-        try:
-            get_ocr()
-            print("✅ OCR listo")
-        except Exception as e:
-            print("❌ OCR warmup falló:", repr(e))
-
-    t = threading.Thread(target=_bg, daemon=True)
-    t.start()
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -836,8 +750,37 @@ async def parse_image(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
 ):
-    _ = await file.read()
-    return {"items": []}
+    # Si OCR está desactivado, no hacemos nada (y NO descargamos modelos)
+    if not ENABLE_OCR:
+        _ = await file.read()
+        return {"items": []}
+
+    # OCR activado
+    ocr = get_ocr()  # puede tardar la primera vez y descargar modelos
+    if ocr is None:
+        _ = await file.read()
+        return {"items": []}
+
+    data = await file.read()
+
+    # Decodificar imagen sin cv2 (para evitar problemas de opencv en Render)
+    import numpy as np
+    import cv2
+
+    img_array = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid image")
+
+    h = img.shape[0]
+
+    try:
+        result = ocr.ocr(img, cls=False)
+        items = _parse_rows_from_ocr(result, img_height=h)
+        return {"items": items}
+    except Exception as e:
+        # No tiramos el backend abajo por OCR
+        raise HTTPException(status_code=503, detail=f"OCR failed: {repr(e)}")
 
 
 @app.get("/")

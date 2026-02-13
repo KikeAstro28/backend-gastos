@@ -1,19 +1,23 @@
+# =========================
+# ENV (DEBE IR LO PRIMERO)
+# =========================
 import os
 
-os.environ["PADDLEOCR_HOME"] = "/var/paddleocr"
-os.environ["PADDLEOCR_HOME"] = "/tmp/paddleocr"   # o mejor un disco persistente
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# Carpeta donde PaddleOCR guarda modelos (en Render /tmp suele ser escribible)
+os.environ["PADDLEOCR_HOME"] = os.getenv("PADDLEOCR_HOME", "/tmp/paddleocr")
+
+# Limitar threads para que Render no se ahogue
+os.environ["OMP_NUM_THREADS"] = os.getenv("OMP_NUM_THREADS", "1")
+os.environ["OPENBLAS_NUM_THREADS"] = os.getenv("OPENBLAS_NUM_THREADS", "1")
+os.environ["MKL_NUM_THREADS"] = os.getenv("MKL_NUM_THREADS", "1")
+os.environ["NUMEXPR_NUM_THREADS"] = os.getenv("NUMEXPR_NUM_THREADS", "1")
 
 
 from datetime import datetime, timedelta
 from typing import List, Optional
-import os
 from urllib.parse import unquote
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -34,13 +38,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 
-from fastapi import UploadFile, File
 import re
 import numpy as np
 import cv2
 
-
-from fastapi import Response
 
 # =========================
 # CONFIG
@@ -67,7 +68,6 @@ DEFAULT_CATEGORIES = [
 ]
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
-
 security = HTTPBearer()
 
 # =========================
@@ -131,8 +131,6 @@ def ensure_schema():
 # =========================
 # DB MODELS
 # =========================
-
-# =========================
 class User(Base):
     __tablename__ = "users"
 
@@ -171,9 +169,20 @@ class Category(Base):
     user = relationship("User")
 
 
+class HiddenCategory(Base):
+    __tablename__ = "hidden_categories"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_user_hidden_category"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+
+    user = relationship("User")
+
+
 Base.metadata.create_all(bind=engine)
 ensure_schema()
-
+Base.metadata.create_all(bind=engine)
 
 # =========================
 # Pydantic Schemas
@@ -209,20 +218,10 @@ class ExpenseOut(BaseModel):
     category: str
     extra: str
 
+
 class CategoryIn(BaseModel):
     name: str = Field(min_length=1, max_length=64)
 
-class HiddenCategory(Base):
-    __tablename__ = "hidden_categories"
-    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_user_hidden_category"),)
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    name = Column(String, nullable=False)
-
-    user = relationship("User")
-
-Base.metadata.create_all(bind=engine)
 
 class ExpenseUpdate(BaseModel):
     date: Optional[str] = None
@@ -236,8 +235,10 @@ class MeResponse(BaseModel):
     nickname: str
     email: Optional[str] = None
 
+
 class UpdateEmailRequest(BaseModel):
     email: str = Field(min_length=3, max_length=120)
+
 
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=4, max_length=128)
@@ -247,6 +248,7 @@ class ChangePasswordRequest(BaseModel):
 class ParseTextRequest(BaseModel):
     text: str = Field(min_length=1)
 
+
 class ParsedExpenseItem(BaseModel):
     date: str
     description: str
@@ -255,8 +257,11 @@ class ParsedExpenseItem(BaseModel):
     extra: str = ""
     confidence: float = 0.0
 
+
 class ParseResponse(BaseModel):
     items: List[ParsedExpenseItem]
+
+
 # =========================
 # HELPERS
 # =========================
@@ -314,18 +319,15 @@ def expense_to_out(e: Expense) -> ExpenseOut:
 def _today_iso():
     return datetime.utcnow().isoformat()
 
+
 def _simple_amount_guess(text: str):
     m = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€?", text)
     if not m:
         return None
     return float(m.group(1).replace(",", "."))
 
+
 def _parse_rows_from_ocr(ocr_result, img_height: int):
-    """
-    ocr_result: salida de PaddleOCR. Agrupamos por coordenada Y para formar filas.
-    Esperamos filas tipo:
-    02/02/2026  Fibra casa  27  Suscripciones  Internet
-    """
     items = []
 
     if not ocr_result or not ocr_result[0]:
@@ -348,7 +350,6 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
     blocks.sort(key=lambda t: (t[0], t[1]))
 
-    # y_tol adaptativo (funciona mejor si cambias resolución)
     y_tol = max(10, int(img_height * 0.012))  # ~1.2% del alto
 
     rows = []
@@ -375,13 +376,11 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
         if not texts:
             continue
 
-        # Fecha en primera columna
         if not date_re.match(texts[0]):
             continue
 
         date_str = texts[0]
 
-        # Buscar amount (evitar pillar el año)
         amount = None
         amount_idx = None
         for i, s in enumerate(texts):
@@ -390,17 +389,14 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
             if not amount_re.match(s2):
                 continue
 
-            # si es un entero de 4 dígitos tipo 2026 → NO
             if s2.isdigit() and len(s2) == 4:
                 continue
 
-            # amounts típicos: 27, 10, 1,8, 38,57 etc.
             if len(s2) <= 6 or ("," in s2 or "." in s2):
                 amount = float(s2.replace(",", "."))
                 amount_idx = i
                 break
 
-        # debe haber al menos una palabra de descripción
         if amount is None or amount_idx is None or amount_idx < 2:
             continue
 
@@ -428,22 +424,35 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
     return items
 
+
+# =========================
+# OCR SINGLETON (clave)
+# =========================
 ocr = None
+ocr_ready = False
 
+def init_ocr():
+    """Inicializa OCR una vez (en startup)."""
+    global ocr, ocr_ready
+    if ocr_ready and ocr is not None:
+        return
 
+    from paddleocr import PaddleOCR
 
+    ocr = PaddleOCR(
+        use_angle_cls=False,
+        lang="en",
+        show_log=False,
+        use_gpu=False,
+    )
+    ocr_ready = True
 
 
 def get_ocr():
-    global ocr
-    if ocr is None:
-        from paddleocr import PaddleOCR  # <-- IMPORTANTE
-        ocr = PaddleOCR(
-            use_angle_cls=False,   # quitamos clasificador
-            lang="en",
-            show_log=False,
-            use_gpu=False
-        )
+    """Devuelve OCR ya inicializado."""
+    global ocr, ocr_ready
+    if not ocr_ready or ocr is None:
+        raise HTTPException(status_code=503, detail="OCR aún no está listo. Reintenta en unos segundos.")
     return ocr
 
 
@@ -453,26 +462,27 @@ def get_ocr():
 app = FastAPI()
 
 
-# CORS: para Flutter Web
 @app.on_event("startup")
 def warmup():
+    # fuerza descarga/initialización al arrancar
     try:
-        get_ocr()  # fuerza descarga/initialización al arrancar
-        print("✅ OCR listo")
+        init_ocr()
+        print("✅ OCR listo (warmup)")
+        print("PADDLEOCR_HOME =", os.environ.get("PADDLEOCR_HOME"))
     except Exception as e:
-        print("❌ OCR warmup falló:", e)
+        # No rompemos el servidor entero: pero avisamos en logs
+        print("❌ OCR warmup falló:", repr(e))
 
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://kikeastro28.github.io",          # GitHub Pages ORIGIN (sin /frontend-gastos/)
+        "https://kikeastro28.github.io",
         "http://localhost:5173",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:8000",
     ],
-
     allow_origin_regex=r"^http://localhost:\d+$|^http://127\.0\.0\.1:\d+$",
     allow_credentials=True,
     allow_methods=["*"],
@@ -510,9 +520,8 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
 
 
 # =========================
-# EXPENSES (PROTEGIDO)
+# CATEGORIES / EXPENSES
 # =========================
-
 @app.get("/categories", response_model=List[str])
 def list_categories(
     user: User = Depends(get_current_user),
@@ -520,12 +529,10 @@ def list_categories(
 ):
     rows = db.query(Category).filter(Category.user_id == user.id).order_by(Category.name.asc()).all()
     custom = [r.name for r in rows]
-    
+
     hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
     hidden = {r.name.strip().lower() for r in hidden_rows}
 
-
-    # unir defaults + custom sin duplicados, preservando defaults primero
     out = []
     seen = set()
     for c in DEFAULT_CATEGORIES + custom:
@@ -543,7 +550,6 @@ def list_categories(
 
 
 @app.post("/categories")
-
 def add_category(
     payload: CategoryIn,
     user: User = Depends(get_current_user),
@@ -560,12 +566,11 @@ def add_category(
         .first()
     )
     if exists:
-        return {"ok": True}  # ya existe, no pasa nada
+        return {"ok": True}
 
     db.add(Category(user_id=user.id, name=name))
     db.commit()
     return {"ok": True}
-
 
 
 @app.get("/expenses", response_model=List[ExpenseOut])
@@ -645,7 +650,6 @@ def delete_category(
     if not name:
         raise HTTPException(status_code=400, detail="Empty category")
 
-    # No borramos categorías por defecto (seguridad)
     if name.lower() in {c.lower() for c in DEFAULT_CATEGORIES}:
         raise HTTPException(status_code=400, detail="Cannot delete default category")
 
@@ -661,6 +665,7 @@ def delete_category(
     db.delete(row)
     db.commit()
     return {"ok": True}
+
 
 @app.post("/categories/hide")
 def hide_category(
@@ -684,6 +689,7 @@ def hide_category(
     db.add(HiddenCategory(user_id=user.id, name=name))
     db.commit()
     return {"ok": True}
+
 
 @app.post("/categories/unhide")
 def unhide_category(
@@ -760,6 +766,7 @@ def delete_expense(
     db.commit()
     return {"ok": True}
 
+
 @app.get("/me", response_model=MeResponse)
 def me(user: User = Depends(get_current_user)):
     return MeResponse(nickname=user.nickname, email=user.email)
@@ -795,15 +802,24 @@ def change_password(
     db.commit()
     return {"ok": True}
 
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "backend-gastos"}
 
 
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
+
+
+# =========================
+# PARSERS
+# =========================
 @app.post("/parse/text", response_model=ParseResponse)
 def parse_text(
     payload: ParseTextRequest,
-    user: User = Depends(get_current_user),  # si quieres que sea público, quita esta línea
+    user: User = Depends(get_current_user),
 ):
     txt = payload.text.strip()
     amount = _simple_amount_guess(txt)
@@ -822,7 +838,6 @@ def parse_text(
     return {"items": [item]}
 
 
-
 @app.post("/parse/image", response_model=ParseResponse)
 async def parse_image(
     file: UploadFile = File(...),
@@ -832,7 +847,6 @@ async def parse_image(
     if not data or len(data) < 10:
         raise HTTPException(status_code=400, detail="Archivo vacío o no recibido")
 
-    # bytes -> imagen (opencv)
     npimg = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
     if img is None:
@@ -840,21 +854,14 @@ async def parse_image(
 
     h, w = img.shape[:2]
 
-    # opcional: bajar resolución si viene enorme
     max_w = 1280
     if w > max_w:
         scale = max_w / w
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
         h, w = img.shape[:2]
 
-    ocr_instance = get_ocr()
+    ocr_instance = get_ocr()  # aquí ya debe estar listo, o devuelve 503
     result = ocr_instance.ocr(img, cls=False)
 
     items = _parse_rows_from_ocr(result, img_height=h)
-
     return ParseResponse(items=items)
-
-
-@app.head("/")
-def root_head():
-    return Response(status_code=200)

@@ -1,29 +1,9 @@
 import os
-
-# En Render, /tmp es escribible siempre. Evitamos /var/data y similares.
-BASE = "/tmp/paddleocr"
-
-os.makedirs(BASE, exist_ok=True)
-
-# Fuerza rutas de cache/modelos
-os.environ["PADDLEOCR_HOME"] = BASE
-os.environ["HOME"] = "/tmp"                # MUY IMPORTANTE: evita que use /var/data
-os.environ["XDG_CACHE_HOME"] = "/tmp"      # caches linux
-os.environ["XDG_CONFIG_HOME"] = "/tmp"
-
-# Reduce hilos para que no reviente memoria/CPU
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
-
-
+import re
+import threading
 from datetime import datetime, timedelta
 from typing import List, Optional
 from urllib.parse import unquote
-import re
-import threading
 
 import numpy as np
 import cv2
@@ -48,6 +28,23 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 from passlib.context import CryptContext
 from jose import jwt, JWTError
+
+
+# ============================================================
+# ✅ CAMBIO 1: Forzar cache/modelos OCR a /tmp (siempre escribible)
+# ============================================================
+# En Render /var/data a veces da PermissionError (como te ha pasado).
+# /tmp SIEMPRE suele ser escribible.
+OCR_HOME = os.getenv("OCR_HOME", "/tmp")
+os.environ["HOME"] = OCR_HOME
+os.environ["XDG_CACHE_HOME"] = os.path.join(OCR_HOME, ".cache")
+os.environ["PADDLEOCR_HOME"] = os.path.join(OCR_HOME, ".paddleocr")
+
+# Reducir hilos para evitar que Render mate el proceso (SIGTERM)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 
 # =========================
@@ -84,6 +81,7 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 # =========================
 # MIGRACIÓN SIMPLE (email)
@@ -131,6 +129,7 @@ def ensure_schema():
 
             if not col_exists:
                 conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR"))
+
 
 # =========================
 # DB MODELS
@@ -184,6 +183,7 @@ class HiddenCategory(Base):
 
 Base.metadata.create_all(bind=engine)
 ensure_schema()
+
 
 # =========================
 # Pydantic Schemas
@@ -336,15 +336,15 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
     blocks = []
     for line in ocr_result[0]:
         box = line[0]
-        text, conf = line[1]
-        text = (text or "").strip()
-        if not text:
+        text_, conf = line[1]
+        text_ = (text_ or "").strip()
+        if not text_:
             continue
         ys = [p[1] for p in box]
         xs = [p[0] for p in box]
         y_center = sum(ys) / len(ys)
         x_center = sum(xs) / len(xs)
-        blocks.append((y_center, x_center, text, float(conf)))
+        blocks.append((y_center, x_center, text_, float(conf)))
 
     blocks.sort(key=lambda t: (t[0], t[1]))
     y_tol = max(10, int(img_height * 0.012))
@@ -416,32 +416,37 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
     return items
 
 
-# =========================
-# OCR (lazy + lock)
-# =========================
+# ============================================================
+# ✅ CAMBIO 2: OCR Lazy + Lock + Warmup en background (sin bloquear)
+# ============================================================
 ocr = None
 ocr_lock = threading.Lock()
+ocr_ready = False
+
 
 def get_ocr():
-    global ocr
-    if ocr is not None:
+    global ocr, ocr_ready
+    if ocr is not None and ocr_ready:
         return ocr
 
     with ocr_lock:
-        if ocr is not None:
+        if ocr is not None and ocr_ready:
             return ocr
 
         try:
             from paddleocr import PaddleOCR
+
             ocr = PaddleOCR(
                 use_angle_cls=False,
                 lang="en",
                 show_log=False,
                 use_gpu=False,
             )
+            ocr_ready = True
             print("✅ OCR inicializado")
             return ocr
         except Exception as e:
+            ocr_ready = False
             print("❌ OCR init falló:", repr(e))
             raise
 
@@ -451,18 +456,20 @@ def get_ocr():
 # =========================
 app = FastAPI()
 
-from threading import Thread
 
 @app.on_event("startup")
 def warmup():
+    # Warmup en background: Render no se queda colgado y no mata el proceso.
     def _bg():
         try:
             get_ocr()
             print("✅ OCR listo")
         except Exception as e:
-            print("❌ OCR warmup falló:", e)
+            print("❌ OCR warmup falló:", repr(e))
 
-    Thread(target=_bg, daemon=True).start()
+    t = threading.Thread(target=_bg, daemon=True)
+    t.start()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -784,7 +791,7 @@ async def parse_image(file: UploadFile = File(...), user: User = Depends(get_cur
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
         h, w = img.shape[:2]
 
-    # OCR lazy init (y si falla, devolvemos 503)
+    # Si OCR aún no está listo => 503 (frontend lo puede reintentar)
     try:
         ocr_instance = get_ocr()
     except Exception:

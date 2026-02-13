@@ -1,16 +1,22 @@
 import os
 
-# En Render con disco persistente montado en /var/data
-PERSIST_DIR = os.getenv("PERSIST_DIR", "/var/data")
+# En Render, /tmp es escribible siempre. Evitamos /var/data y similares.
+BASE = "/tmp/paddleocr"
 
-os.environ["HOME"] = PERSIST_DIR
-os.environ["XDG_CACHE_HOME"] = os.path.join(PERSIST_DIR, ".cache")
-os.environ["PADDLEOCR_HOME"] = os.path.join(PERSIST_DIR, "paddleocr")
+os.makedirs(BASE, exist_ok=True)
 
+# Fuerza rutas de cache/modelos
+os.environ["PADDLEOCR_HOME"] = BASE
+os.environ["HOME"] = "/tmp"                # MUY IMPORTANTE: evita que use /var/data
+os.environ["XDG_CACHE_HOME"] = "/tmp"      # caches linux
+os.environ["XDG_CONFIG_HOME"] = "/tmp"
+
+# Reduce hilos para que no reviente memoria/CPU
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 
 
 from datetime import datetime, timedelta

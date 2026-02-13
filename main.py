@@ -45,7 +45,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 from passlib.context import CryptContext
 from jose import jwt, JWTError
-
+import tempfile
 
 # ============================================================
 # ✅ CAMBIO 1: Forzar cache/modelos OCR a /tmp (siempre escribible)
@@ -499,6 +499,12 @@ def ensure_ocr_background():
         t = threading.Thread(target=_init_ocr_blocking, daemon=True)
         t.start()
 
+PADDLE_HOME = os.getenv("PADDLEOCR_HOME", "/tmp/paddleocr")
+os.environ["PADDLEOCR_HOME"] = PADDLE_HOME
+os.makedirs(PADDLE_HOME, exist_ok=True)
+
+ocr = None
+ocr_init_error = None
 
 # =========================
 # APP
@@ -506,9 +512,19 @@ def ensure_ocr_background():
 app = FastAPI()
 
 @app.on_event("startup")
-def startup_event():
-    # Arranca la descarga/init en background
-    ensure_ocr_background()
+def _init_ocr():
+    global ocr, ocr_init_error
+    try:
+        from paddleocr import PaddleOCR
+        # Importante: instanciar UNA vez, y sin show_log para no petar logs
+        ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+        ocr_init_error = None
+        print("✅ PaddleOCR inicializado")
+    except Exception as e:
+        ocr = None
+        ocr_init_error = repr(e)
+        print("❌ OCR init falló:", ocr_init_error)
+
 
 
 
@@ -833,34 +849,39 @@ async def parse_image(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
 ):
-    data = await file.read()
-    if not data or len(data) < 10:
-        raise HTTPException(status_code=400, detail="Archivo vacío o no recibido")
-
-    # Si OCR aún no está listo, no bloquees la request -> 503
-    if ocr_status["state"] != "ready":
-        ensure_ocr_background()
+    # Si OCR no está listo, devolvemos 503 con info (no NetworkError misterioso)
+    if ocr is None:
         raise HTTPException(
             status_code=503,
-            detail="OCR calentando/descargando modelos. Reintenta en 20-30s."
+            detail=f"OCR not available. init_error={ocr_init_error}",
         )
 
-    npimg = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(npimg, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="No se pudo decodificar la imagen")
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
 
-    h, w = img.shape[:2]
-    max_w = 1280
-    if w > max_w:
-        scale = max_w / w
-        img = cv2.resize(img, (int(w * scale), int(h * scale)))
-        h, w = img.shape[:2]
+    # PaddleOCR suele ir mejor con ruta de fichero que con bytes directos
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+            tmp.write(content)
+            tmp_path = tmp.name
 
-    # Ejecutar OCR
-    result = ocr.ocr(img, cls=False)
-    items = _parse_rows_from_ocr(result, img_height=h)
-    return ParseResponse(items=items)
+        result = ocr.ocr(tmp_path, cls=True)
+
+        # De momento devolvemos vacío (tu lógica de parseo ya la metemos luego)
+        return {"items": []}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OCR failed: {repr(e)}")
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except:
+                pass
+
 
 @app.get("/")
 def root():

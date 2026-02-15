@@ -33,6 +33,143 @@ OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
 OCR_LANG = os.getenv("OCR_LANG", "spa")  # OCR.space usa: spa, eng, etc.
 
 
+# =========================
+# AI (OpenAI) - estructurar OCR -> items
+# =========================
+AI_PROVIDER = os.getenv("AI_PROVIDER", "none").lower()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+async def ai_parse_items_from_text(raw_text: str, allowed_categories: List[str]) -> List["ParsedExpenseItem"]:
+    """
+    Convierte texto OCR (sucio) en items estructurados usando IA.
+    Devuelve lista ParsedExpenseItem con date ISO "YYYY-MM-DDT00:00:00".
+    """
+    if AI_PROVIDER != "openai":
+        return []
+
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+
+    # JSON Schema estricto (Structured Outputs)
+    schema = {
+        "name": "parsed_expenses",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "date": {"type": "string"},        # "YYYY-MM-DDT00:00:00"
+                            "description": {"type": "string"},
+                            "amount": {"type": "number"},
+                            "category": {"type": "string"},
+                            "extra": {"type": "string"},
+                            "confidence": {"type": "number"},
+                        },
+                        "required": ["date", "description", "amount", "category", "extra", "confidence"],
+                    },
+                }
+            },
+            "required": ["items"],
+        },
+    }
+
+    system = (
+        "Eres un extractor de gastos. A partir de texto OCR (posiblemente desordenado), "
+        "devuelve SOLO JSON válido que cumpla el esquema. "
+        "Reglas:\n"
+        "- date SIEMPRE en formato ISO: YYYY-MM-DDT00:00:00\n"
+        "- amount en euros (float)\n"
+        "- category debe ser UNA de las categorías permitidas\n"
+        "- extra puede ser '' si no hay\n"
+        "- No inventes importes.\n"
+        "- Si hay filas tipo Excel (fecha | descripción | importe | categoría | extra), respétalas.\n"
+    )
+
+    user = (
+        "CATEGORÍAS PERMITIDAS:\n"
+        + "\n".join(f"- {c}" for c in allowed_categories)
+        + "\n\n"
+        "TEXTO OCR:\n"
+        + raw_text
+    )
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": schema,
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"OpenAI error {r.status_code}: {r.text}")
+
+    data = r.json()
+
+    # En Responses API, el contenido suele venir dentro de output_text o output[].content[]
+    # Para ir a lo seguro: buscamos el primer bloque de texto.
+    text_json = None
+    try:
+        # 1) output_text (si existe)
+        text_json = data.get("output_text")
+        if not text_json:
+            # 2) output -> content -> text
+            out = data.get("output", [])
+            for msg in out:
+                for c in msg.get("content", []):
+                    if c.get("type") in ("output_text", "text"):
+                        text_json = c.get("text")
+                        break
+                if text_json:
+                    break
+    except Exception:
+        text_json = None
+
+    if not text_json:
+        return []
+
+    try:
+        obj = __import__("json").loads(text_json)
+        items = obj.get("items", [])
+        parsed: List[ParsedExpenseItem] = []
+        for it in items:
+            parsed.append(
+                ParsedExpenseItem(
+                    date=(it.get("date") or "").strip(),
+                    description=(it.get("description") or "").strip()[:120] or "Gasto",
+                    amount=float(it.get("amount") or 0),
+                    category=(it.get("category") or allowed_categories[0])[:64],
+                    extra=(it.get("extra") or "")[:120],
+                    confidence=float(it.get("confidence") or 0.5),
+                )
+            )
+        # Filtra basura
+        parsed = [p for p in parsed if p.amount > 0 and p.date]
+        return parsed
+    except Exception:
+        return []
+
+
+
 async def ocr_via_ocrspace(file_like) -> str:
     """
     file_like debe tener:
@@ -841,13 +978,48 @@ def change_password(payload: ChangePasswordRequest, user: User = Depends(get_cur
 # PARSE
 # =========================
 @app.post("/parse/text", response_model=ParseResponse)
-def parse_text(payload: ParseTextRequest, user: User = Depends(get_current_user)):
+async def parse_text(
+    payload: ParseTextRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # ✅ categorías permitidas (default + custom - hidden)
+    custom_rows = (
+        db.query(Category)
+        .filter(Category.user_id == user.id)
+        .order_by(Category.name.asc())
+        .all()
+    )
+    custom = [r.name for r in custom_rows]
+
+    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
+    hidden = {r.name.strip().lower() for r in hidden_rows}
+
+    allowed = []
+    seen = set()
+    for c in DEFAULT_CATEGORIES + custom:
+        k = c.strip()
+        if not k:
+            continue
+        if k.lower() in hidden:
+            continue
+        if k.lower() in seen:
+            continue
+        seen.add(k.lower())
+        allowed.append(k)
+
+    # ✅ 1) IA primero
+    ai_items = await ai_parse_items_from_text(payload.text, allowed)
+    if ai_items:
+        return {"items": ai_items}
+
+    # ✅ 2) fallback regex
     items = parse_text_to_items(payload.text)
     return {"items": items}
 
 
 @app.post("/parse/image", response_model=ParseResponse)
-async def parse_image(file: UploadFile = File(...), user: User = Depends(get_current_user)):
+async def parse_image(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     data = await file.read()
 
     kind = _detect_image_kind(data) or _ext_from_filename(file.filename or "")
@@ -873,10 +1045,31 @@ async def parse_image(file: UploadFile = File(...), user: User = Depends(get_cur
     )
 
     text_out = await ocr_via_ocrspace(mem)
-
     if not text_out.strip():
         return {"items": []}
 
+    # ✅ categorías permitidas (default + custom, sin hidden)
+    custom_rows = db.query(Category).filter(Category.user_id == user.id).order_by(Category.name.asc()).all()
+    custom = [r.name for r in custom_rows]
+    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
+    hidden = {r.name.strip().lower() for r in hidden_rows}
+
+    allowed = []
+    seen = set()
+    for c in DEFAULT_CATEGORIES + custom:
+        if c.lower() in hidden:
+            continue
+        if c.lower() in seen:
+            continue
+        seen.add(c.lower())
+        allowed.append(c)
+
+    # ✅ 1) IA primero
+    ai_items = await ai_parse_items_from_text(text_out, allowed)
+    if ai_items:
+        return {"items": ai_items}
+
+    # ✅ 2) fallback (tu parser viejo)
     items = parse_text_to_items(text_out)
     return {"items": items}
 

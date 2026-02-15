@@ -1,11 +1,10 @@
 import os
 import re
-import threading
 from datetime import datetime, timedelta
-from functools import lru_cache
 from typing import List, Optional
 from urllib.parse import unquote
 
+import httpx
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -26,30 +25,52 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 # ============================================================
-# ✅ CAMBIO CLAVE: NO inicializar OCR en startup/import
-# - Render te mata el proceso (SIGTERM) por RAM/tiempo al cargar PaddleOCR
-# - Además PaddleOCR descarga modelos en runtime => rompe requests (login, etc.)
-# - Solución: OCR totalmente "lazy" y desactivable por ENV: ENABLE_OCR=0/1
+# OCR (Render FREE): OCR.space
+# - NO PaddleOCR (evita SIGTERM / RAM / descargas)
+# - Actívalo con: OCR_PROVIDER=ocrspace
+# - Requiere: OCRSPACE_API_KEY
+# - Idioma: OCR_LANG=spa (por defecto)
 # ============================================================
+OCR_PROVIDER = os.getenv("OCR_PROVIDER", "none").lower()
+OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
+OCR_LANG = os.getenv("OCR_LANG", "spa")  # OCR.space: "spa" (español), "eng" (inglés), etc.
 
-# Cache dirs siempre escribibles
-PERSIST_DIR = os.getenv("PERSIST_DIR", "/tmp")
-if not os.path.isdir(PERSIST_DIR) or not os.access(PERSIST_DIR, os.W_OK):
-    PERSIST_DIR = "/tmp"
+async def ocr_via_ocrspace(file: UploadFile) -> str:
+    if not OCRSPACE_API_KEY:
+        raise HTTPException(status_code=500, detail="OCRSPACE_API_KEY no configurada")
 
-os.environ["HOME"] = PERSIST_DIR
-os.environ["XDG_CACHE_HOME"] = os.path.join(PERSIST_DIR, ".cache")
-os.environ["PADDLEOCR_HOME"] = os.path.join(PERSIST_DIR, ".paddleocr")
+    content = await file.read()
 
-# Limitar hilos para que Render no te mate el proceso
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    url = "https://api.ocr.space/parse/image"
+    data = {
+        "apikey": OCRSPACE_API_KEY,
+        "language": OCR_LANG,
+        "isOverlayRequired": "false",
+        "OCREngine": "2",  # suele ir mejor
+        # "detectOrientation": "true",  # opcional
+    }
+    files = {
+        "filename": (file.filename or "image.jpg", content, file.content_type or "application/octet-stream")
+    }
 
-# Flag para activar/desactivar OCR (en Render pon ENABLE_OCR=0 para estabilidad)
-ENABLE_OCR = os.getenv("ENABLE_OCR", "0") == "1"
-OCR_LANG = os.getenv("OCR_LANG", "en")
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(url, data=data, files=files)
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"OCR.space error {r.status_code}: {r.text}")
+
+    j = r.json()
+
+    # OCR.space => ParsedResults[0].ParsedText
+    try:
+        parsed_results = j.get("ParsedResults", [])
+        if not parsed_results:
+            return ""
+        text_out = parsed_results[0].get("ParsedText", "") or ""
+        return text_out.strip()
+    except Exception:
+        return ""
+
 
 # =========================
 # CONFIG
@@ -320,7 +341,7 @@ def expense_to_out(e: Expense) -> ExpenseOut:
     )
 
 
-def _today_iso():
+def _today_iso() -> str:
     return datetime.utcnow().isoformat()
 
 
@@ -331,116 +352,22 @@ def _simple_amount_guess(text: str):
     return float(m.group(1).replace(",", "."))
 
 
-def _parse_rows_from_ocr(ocr_result, img_height: int):
-    items = []
-    if not ocr_result or not ocr_result[0]:
-        return items
-
-    blocks = []
-    for line in ocr_result[0]:
-        box = line[0]
-        text_, conf = line[1]
-        text_ = (text_ or "").strip()
-        if not text_:
-            continue
-        ys = [p[1] for p in box]
-        xs = [p[0] for p in box]
-        y_center = sum(ys) / len(ys)
-        x_center = sum(xs) / len(xs)
-        blocks.append((y_center, x_center, text_, float(conf)))
-
-    blocks.sort(key=lambda t: (t[0], t[1]))
-    y_tol = max(10, int(img_height * 0.012))
-
-    rows = []
-    current = []
-    last_y = None
-    for y, x, txt, conf in blocks:
-        if last_y is None or abs(y - last_y) <= y_tol:
-            current.append((x, txt, conf))
-            last_y = y if last_y is None else (last_y * 0.7 + y * 0.3)
-        else:
-            rows.append(sorted(current, key=lambda a: a[0]))
-            current = [(x, txt, conf)]
-            last_y = y
-    if current:
-        rows.append(sorted(current, key=lambda a: a[0]))
-
-    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-    amount_re = re.compile(r"^\d+(?:[.,]\d+)?$")
-
-    for r in rows:
-        texts = [t[1] for t in r if t[1]]
-        if not texts:
-            continue
-        if not date_re.match(texts[0]):
-            continue
-
-        date_str = texts[0]
-
-        amount = None
-        amount_idx = None
-        for i, s in enumerate(texts):
-            s2 = s.replace("€", "").strip()
-            if not amount_re.match(s2):
-                continue
-            if s2.isdigit() and len(s2) == 4:
-                continue
-            if len(s2) <= 6 or ("," in s2 or "." in s2):
-                amount = float(s2.replace(",", "."))
-                amount_idx = i
-                break
-
-        if amount is None or amount_idx is None or amount_idx < 2:
-            continue
-
-        description = " ".join(texts[1:amount_idx]).strip()
-        tail = texts[amount_idx + 1:]
-
-        category = tail[0].strip() if len(tail) >= 1 else DEFAULT_CATEGORIES[0]
-        extra = " ".join(tail[1:]).strip() if len(tail) >= 2 else ""
-
-        dd, mm, yyyy = date_str.split("/")
-        iso_date = f"{yyyy}-{mm}-{dd}T00:00:00"
-
-        conf_avg = sum(t[2] for t in r) / max(1, len(r))
-
-        items.append(
-            ParsedExpenseItem(
-                date=iso_date,
-                description=(description[:120] if description else "Gasto"),
-                amount=amount,
-                category=category[:64],
-                extra=extra[:120],
-                confidence=conf_avg,
-            )
-        )
-
-    return items
-
 amount_anywhere_re = re.compile(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?")
 
 def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
     """
-    Fallback para tickets/capturas donde NO hay filas tipo:
-    dd/mm/yyyy  descripcion  importe  categoria  extra
-    Extrae varios importes y crea varios items.
+    Fallback rápido: saca items por líneas que contengan importes.
     """
     items: List[ParsedExpenseItem] = []
-
     clean = []
     for ln in lines:
         s = (ln or "").strip()
-        if not s:
-            continue
-        # evita basura demasiado corta
-        if len(s) <= 1:
+        if not s or len(s) <= 1:
             continue
         clean.append(s)
 
     for ln in clean:
-        # si la línea tiene un importe, lo pillamos
-        m = amount_anywhere_re.search(ln.replace(" ", ""))
+        m = amount_anywhere_re.search(ln)
         if not m:
             continue
 
@@ -450,9 +377,7 @@ def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
         except:
             continue
 
-        # descripción = la línea sin el importe (lo dejamos decente)
-        desc = ln
-        desc = desc.replace(m.group(0), "").strip(" -:\t")
+        desc = ln.replace(m.group(0), "").strip(" -:\t")
         if not desc:
             desc = "Gasto"
 
@@ -460,32 +385,46 @@ def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
             ParsedExpenseItem(
                 date=_today_iso(),
                 description=desc[:120],
-                amount=abs(amount),  # normalmente tickets vienen positivos; si viene negativo lo normalizamos
+                amount=abs(amount),
                 category=DEFAULT_CATEGORIES[0],
                 extra="",
-                confidence=0.20,
+                confidence=0.25,
             )
         )
-
     return items
 
-# ============================================================
-# ✅ OCR LAZY (NO startup, NO warmup)
-# - Import de PaddleOCR solo si ENABLE_OCR=1
-# - Cachea el objeto OCR una vez
-# ============================================================
-@lru_cache(maxsize=1)
-def get_ocr():
-    if not ENABLE_OCR:
-        return None
-    # Import aquí dentro: si OCR está off, nunca importa ni descarga modelos
-    from paddleocr import PaddleOCR
-    return PaddleOCR(
-        use_angle_cls=False,
-        lang=OCR_LANG,
-        show_log=False,
-        use_gpu=False,
-    )
+
+def parse_text_to_items(text_in: str) -> List[ParsedExpenseItem]:
+    """
+    Convierte texto (OCR o dictado) en items.
+    - Si hay una sola línea: intenta sacar un importe y crea 1 item.
+    - Si hay varias líneas: usa fallback por líneas con importes.
+    """
+    txt = (text_in or "").strip()
+    if not txt:
+        return []
+
+    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+
+    # Caso 1: texto corto => 1 item con "best effort"
+    if len(lines) <= 1:
+        amount = _simple_amount_guess(txt)
+        if amount is None:
+            return []
+        return [
+            ParsedExpenseItem(
+                date=_today_iso(),
+                description=txt[:120],
+                amount=float(amount),
+                category=DEFAULT_CATEGORIES[0],
+                extra="",
+                confidence=0.35,
+            )
+        ]
+
+    # Caso 2: varias líneas => varios items si hay importes
+    items = _fallback_items_from_text(lines)
+    return items
 
 
 # =========================
@@ -779,20 +718,8 @@ def change_password(payload: ChangePasswordRequest, user: User = Depends(get_cur
 # =========================
 @app.post("/parse/text", response_model=ParseResponse)
 def parse_text(payload: ParseTextRequest, user: User = Depends(get_current_user)):
-    txt = payload.text.strip()
-    amount = _simple_amount_guess(txt)
-    if amount is None:
-        return {"items": []}
-
-    item = ParsedExpenseItem(
-        date=_today_iso(),
-        description=txt[:120],
-        amount=amount,
-        category=DEFAULT_CATEGORIES[0],
-        extra="",
-        confidence=0.3,
-    )
-    return {"items": [item]}
+    items = parse_text_to_items(payload.text)
+    return {"items": items}
 
 
 @app.post("/parse/image", response_model=ParseResponse)
@@ -800,56 +727,19 @@ async def parse_image(
     file: UploadFile = File(...),
     user: User = Depends(get_current_user),
 ):
-    # Si OCR está desactivado, no hacemos nada (y NO descargamos modelos)
-    if not ENABLE_OCR:
-        _ = await file.read()
-        raise HTTPException(
-            status_code=503,
-            detail="OCR desactivado en el servidor (ENABLE_OCR=0). Actívalo para /parse/image."
-        )
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(status_code=400, detail="Formato no soportado (jpeg/png/webp)")
 
+    if OCR_PROVIDER != "ocrspace":
+        raise HTTPException(status_code=503, detail="OCR desactivado (OCR_PROVIDER!=ocrspace)")
 
-    # OCR activado
-    ocr = get_ocr()  # puede tardar la primera vez y descargar modelos
-    if ocr is None:
-        _ = await file.read()
+    text_out = await ocr_via_ocrspace(file)
+
+    if not text_out.strip():
         return {"items": []}
 
-    data = await file.read()
-
-    # Decodificar imagen sin cv2 (para evitar problemas de opencv en Render)
-    import numpy as np
-    import cv2
-
-    img_array = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Invalid image")
-
-    h = img.shape[0]
-
-    try:
-        result = ocr.ocr(img, cls=False)
-
-        items = _parse_rows_from_ocr(result, img_height=h)
-
-        # Fallback: si no hay filas con fecha al inicio, probamos “por importes”
-        if not items:
-            # saca texto plano de OCR
-            lines = []
-            if result and result[0]:
-                for line in result[0]:
-                    txt = (line[1][0] or "").strip()
-                    if txt:
-                        lines.append(txt)
-
-            items = _fallback_items_from_text(lines)
-
-        return {"items": items}
-
-    except Exception as e:
-        # No tiramos el backend abajo por OCR
-        raise HTTPException(status_code=503, detail=f"OCR failed: {repr(e)}")
+    items = parse_text_to_items(text_out)
+    return {"items": items}
 
 
 @app.get("/")
@@ -860,14 +750,3 @@ def root():
 @app.head("/")
 def root_head():
     return Response(status_code=200)
-
-@app.on_event("startup")
-def warmup_ocr():
-    global ocr
-    if not ENABLE_OCR:
-        return
-    try:
-        _ = get_ocr()  # fuerza inicialización / descarga
-        print("OCR warmup OK")
-    except Exception as e:
-        print(f"OCR warmup FAILED: {e}")

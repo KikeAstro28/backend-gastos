@@ -389,28 +389,153 @@ def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
     return items
 
 
+def _normalize_date(d: str) -> Optional[str]:
+    d = (d or "").strip()
+
+    # yyyy-mm-dd
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", d)
+    if m:
+        yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
+        return f"{yyyy}-{mm}-{dd}T00:00:00"
+
+    # dd/mm/yyyy o dd-mm-yyyy
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", d)
+    if m:
+        dd, mm, yy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+        yyyy = ("20" + yy) if len(yy) == 2 else yy
+        return f"{yyyy}-{mm}-{dd}T00:00:00"
+
+    # dd/mm (sin año) -> año actual
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", d)
+    if m:
+        dd, mm = m.group(1).zfill(2), m.group(2).zfill(2)
+        yyyy = str(datetime.utcnow().year)
+        return f"{yyyy}-{mm}-{dd}T00:00:00"
+
+    return None
+
+
+def _find_amount(text: str) -> Optional[float]:
+    # soporta "12,34", "12.34", "12€", "12,34 €"
+    m = re.search(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except:
+        return None
+
+
+def _pick_category(text: str) -> str:
+    t = (text or "").lower()
+    for c in DEFAULT_CATEGORIES:
+        if c.lower() in t:
+            return c
+    # heurística básica por keywords (opcional, puedes quitarlo si no quieres)
+    if any(k in t for k in ["metro", "uber", "bus", "renfe", "taxi"]):
+        return "Transporte"
+    if any(k in t for k in ["mercadona", "carrefour", "aldi", "lidl", "super", "compra"]):
+        return "Compra/Supermercado"
+    if any(k in t for k in ["cafe", "caf", "bar", "desay", "tost", "menu", "comida", "cena"]):
+        return "Desayuno/Fuera"
+    if any(k in t for k in ["spotify", "netflix", "prime", "chatgpt", "suscrip"]):
+        return "Suscripciones"
+    if any(k in t for k in ["tabaco", "cigar", "vaper"]):
+        return "Tabaco"
+    if any(k in t for k in ["cerve", "vino", "alcohol"]):
+        return "Alcohol/Cervezas"
+
+    return DEFAULT_CATEGORIES[0]
+
+
 def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
     """
-    Convierte texto (OCR o dictado) en items.
-    Ahora mismo: fallback robusto -> busca importes por línea.
+    Intenta sacar: fecha + descripción + importe + categoría + extra
+    - Si el OCR viene por líneas con info dispersa, lo agrupa por proximidad.
     """
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    items = _fallback_items_from_text(lines)
+    raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not raw_lines:
+        return []
 
-    # Si no sacó nada por líneas, intenta sacar un importe suelto del texto completo
+    items: List[ParsedExpenseItem] = []
+
+    # Estrategia:
+    # 1) detecta líneas que tengan importe => candidato a item
+    # 2) para cada candidato, busca fecha cerca (misma línea o líneas anteriores)
+    # 3) limpia descripción quitando fecha/importe/categoría
+    for i, ln in enumerate(raw_lines):
+        amount = _find_amount(ln)
+        if amount is None:
+            continue
+
+        # Buscar fecha en la misma línea o hasta 3 líneas hacia arriba
+        date_iso = _normalize_date(ln)
+        if not date_iso:
+            for j in range(max(0, i - 3), i):
+                date_iso = _normalize_date(raw_lines[j])
+                if date_iso:
+                    break
+        if not date_iso:
+            date_iso = _today_iso()
+
+        # Categoría
+        cat = _pick_category(ln)
+
+        # Descripción y extra
+        desc = ln
+
+        # quita fecha si existe
+        desc = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", desc)
+        desc = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", "", desc)
+
+        # quita importe
+        desc = re.sub(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?", "", desc)
+
+        # quita la categoría escrita (si estaba)
+        desc = desc.replace(cat, "").strip(" -:\t")
+
+        if not desc:
+            # si la línea del importe era muy “seca”, usa algo de líneas previas como descripción
+            prev = raw_lines[i - 1] if i - 1 >= 0 else ""
+            desc = prev[:120] if prev else "Gasto"
+
+        # extra: si hay “ - ” o “ | ” lo que quede al final
+        extra = ""
+        if " - " in ln:
+            parts = ln.split(" - ", 1)
+            if len(parts) == 2:
+                extra = parts[1].strip()[:120]
+
+        items.append(
+            ParsedExpenseItem(
+                date=date_iso,
+                description=desc[:120],
+                amount=abs(float(amount)),
+                category=cat[:64],
+                extra=extra,
+                confidence=0.35,
+            )
+        )
+
+    # Si no encontró ninguna línea con importe, intenta un único item del texto entero
     if not items:
-        amount = _simple_amount_guess(text)
-        if amount is not None:
-            items = [
-                ParsedExpenseItem(
-                    date=_today_iso(),
-                    description=(text.strip()[:120] if text.strip() else "Gasto"),
-                    amount=float(amount),
-                    category=DEFAULT_CATEGORIES[0],
-                    extra="",
-                    confidence=0.15,
-                )
-            ]
+        amount = _find_amount(text)
+        if amount is None:
+            return []
+        date_iso = _normalize_date(text) or _today_iso()
+        cat = _pick_category(text)
+        desc = (text.strip()[:120] if text.strip() else "Gasto")
+        items = [
+            ParsedExpenseItem(
+                date=date_iso,
+                description=desc,
+                amount=abs(float(amount)),
+                category=cat,
+                extra="",
+                confidence=0.20,
+            )
+        ]
+
     return items
 
 

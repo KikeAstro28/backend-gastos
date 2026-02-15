@@ -418,6 +418,56 @@ def _parse_rows_from_ocr(ocr_result, img_height: int):
 
     return items
 
+amount_anywhere_re = re.compile(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?")
+
+def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
+    """
+    Fallback para tickets/capturas donde NO hay filas tipo:
+    dd/mm/yyyy  descripcion  importe  categoria  extra
+    Extrae varios importes y crea varios items.
+    """
+    items: List[ParsedExpenseItem] = []
+
+    clean = []
+    for ln in lines:
+        s = (ln or "").strip()
+        if not s:
+            continue
+        # evita basura demasiado corta
+        if len(s) <= 1:
+            continue
+        clean.append(s)
+
+    for ln in clean:
+        # si la línea tiene un importe, lo pillamos
+        m = amount_anywhere_re.search(ln.replace(" ", ""))
+        if not m:
+            continue
+
+        raw = m.group(1).replace(",", ".")
+        try:
+            amount = float(raw)
+        except:
+            continue
+
+        # descripción = la línea sin el importe (lo dejamos decente)
+        desc = ln
+        desc = desc.replace(m.group(0), "").strip(" -:\t")
+        if not desc:
+            desc = "Gasto"
+
+        items.append(
+            ParsedExpenseItem(
+                date=_today_iso(),
+                description=desc[:120],
+                amount=abs(amount),  # normalmente tickets vienen positivos; si viene negativo lo normalizamos
+                category=DEFAULT_CATEGORIES[0],
+                extra="",
+                confidence=0.20,
+            )
+        )
+
+    return items
 
 # ============================================================
 # ✅ OCR LAZY (NO startup, NO warmup)
@@ -753,7 +803,11 @@ async def parse_image(
     # Si OCR está desactivado, no hacemos nada (y NO descargamos modelos)
     if not ENABLE_OCR:
         _ = await file.read()
-        return {"items": []}
+        raise HTTPException(
+            status_code=503,
+            detail="OCR desactivado en el servidor (ENABLE_OCR=0). Actívalo para /parse/image."
+        )
+
 
     # OCR activado
     ocr = get_ocr()  # puede tardar la primera vez y descargar modelos
@@ -776,8 +830,23 @@ async def parse_image(
 
     try:
         result = ocr.ocr(img, cls=False)
+
         items = _parse_rows_from_ocr(result, img_height=h)
+
+        # Fallback: si no hay filas con fecha al inicio, probamos “por importes”
+        if not items:
+            # saca texto plano de OCR
+            lines = []
+            if result and result[0]:
+                for line in result[0]:
+                    txt = (line[1][0] or "").strip()
+                    if txt:
+                        lines.append(txt)
+
+            items = _fallback_items_from_text(lines)
+
         return {"items": items}
+
     except Exception as e:
         # No tiramos el backend abajo por OCR
         raise HTTPException(status_code=503, detail=f"OCR failed: {repr(e)}")

@@ -860,3 +860,14 @@ def root():
 @app.head("/")
 def root_head():
     return Response(status_code=200)
+
+@app.on_event("startup")
+def warmup_ocr():
+    global ocr
+    if not ENABLE_OCR:
+        return
+    try:
+        _ = get_ocr()  # fuerza inicialización / descarga
+        print("OCR warmup OK")
+    except Exception as e:
+        print(f"OCR warmup FAILED: {e}")

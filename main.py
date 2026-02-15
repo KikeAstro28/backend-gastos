@@ -24,6 +24,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
+
 # =========================
 # OCR (OCR.space)
 # =========================
@@ -31,11 +32,18 @@ OCR_PROVIDER = os.getenv("OCR_PROVIDER", "none").lower()
 OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
 OCR_LANG = os.getenv("OCR_LANG", "spa")  # OCR.space usa: spa, eng, etc.
 
-async def ocr_via_ocrspace(file: UploadFile) -> str:
+
+async def ocr_via_ocrspace(file_like) -> str:
+    """
+    file_like debe tener:
+      - filename
+      - content_type
+      - async read() -> bytes
+    """
     if not OCRSPACE_API_KEY:
         raise HTTPException(status_code=500, detail="OCRSPACE_API_KEY no configurada")
 
-    content = await file.read()
+    content = await file_like.read()
 
     url = "https://api.ocr.space/parse/image"
     data = {
@@ -47,9 +55,9 @@ async def ocr_via_ocrspace(file: UploadFile) -> str:
 
     files = {
         "filename": (
-            file.filename or "image.jpg",
+            getattr(file_like, "filename", None) or "image.jpg",
             content,
-            file.content_type or "application/octet-stream",
+            getattr(file_like, "content_type", None) or "application/octet-stream",
         )
     }
 
@@ -95,6 +103,7 @@ DEFAULT_CATEGORIES = [
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 security = HTTPBearer()
+
 
 # =========================
 # DATABASE
@@ -206,6 +215,7 @@ class HiddenCategory(Base):
 Base.metadata.create_all(bind=engine)
 ensure_schema()
 
+
 # =========================
 # Pydantic Schemas
 # =========================
@@ -225,7 +235,7 @@ class TokenResponse(BaseModel):
 
 
 class ExpenseIn(BaseModel):
-    date: Optional[str] = None
+    date: Optional[str] = None  # "YYYY-MM-DDT00:00:00"
     description: str
     amount: float
     category: str
@@ -272,7 +282,7 @@ class ParseTextRequest(BaseModel):
 
 
 class ParsedExpenseItem(BaseModel):
-    date: str
+    date: str  # "YYYY-MM-DDT00:00:00"
     description: str
     amount: float
     category: str
@@ -338,59 +348,15 @@ def expense_to_out(e: Expense) -> ExpenseOut:
     )
 
 
-def _today_iso():
-    return datetime.utcnow().isoformat()
-
-
-def _simple_amount_guess(text: str):
-    m = re.search(r"(\d+(?:[.,]\d{1,2})?)\s*€?", text)
-    if not m:
-        return None
-    return float(m.group(1).replace(",", "."))
-
-
-amount_anywhere_re = re.compile(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?")
-
-def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
-    items: List[ParsedExpenseItem] = []
-    clean = []
-    for ln in lines:
-        s = (ln or "").strip()
-        if not s or len(s) <= 1:
-            continue
-        clean.append(s)
-
-    for ln in clean:
-        # pillamos el primer importe que aparezca
-        m = amount_anywhere_re.search(ln)
-        if not m:
-            continue
-
-        raw = m.group(1).replace(",", ".")
-        try:
-            amount = float(raw)
-        except:
-            continue
-
-        desc = ln.replace(m.group(0), "").strip(" -:\t")
-        if not desc:
-            desc = "Gasto"
-
-        items.append(
-            ParsedExpenseItem(
-                date=_today_iso(),
-                description=desc[:120],
-                amount=abs(amount),
-                category=DEFAULT_CATEGORIES[0],
-                extra="",
-                confidence=0.20,
-            )
-        )
-    return items
+def _today_iso_midnight() -> str:
+    now = datetime.utcnow()
+    return f"{now.year:04d}-{now.month:02d}-{now.day:02d}T00:00:00"
 
 
 def _normalize_date(d: str) -> Optional[str]:
     d = (d or "").strip()
+    if not d:
+        return None
 
     # yyyy-mm-dd
     m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", d)
@@ -398,17 +364,20 @@ def _normalize_date(d: str) -> Optional[str]:
         yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
         return f"{yyyy}-{mm}-{dd}T00:00:00"
 
-    # dd/mm/yyyy o dd-mm-yyyy
+    # dd/mm/yyyy o dd-mm-yyyy o dd/mm/yy
     m = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", d)
     if m:
-        dd, mm, yy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+        dd = m.group(1).zfill(2)
+        mm = m.group(2).zfill(2)
+        yy = m.group(3)
         yyyy = ("20" + yy) if len(yy) == 2 else yy
         return f"{yyyy}-{mm}-{dd}T00:00:00"
 
     # dd/mm (sin año) -> año actual
     m = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", d)
     if m:
-        dd, mm = m.group(1).zfill(2), m.group(2).zfill(2)
+        dd = m.group(1).zfill(2)
+        mm = m.group(2).zfill(2)
         yyyy = str(datetime.utcnow().year)
         return f"{yyyy}-{mm}-{dd}T00:00:00"
 
@@ -416,22 +385,24 @@ def _normalize_date(d: str) -> Optional[str]:
 
 
 def _find_amount(text: str) -> Optional[float]:
-    # soporta "12,34", "12.34", "12€", "12,34 €"
-    m = re.search(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?", text)
+    m = re.search(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?", text or "")
     if not m:
         return None
     try:
         return float(m.group(1).replace(",", "."))
-    except:
+    except Exception:
         return None
 
 
 def _pick_category(text: str) -> str:
     t = (text or "").lower()
+
+    # si viene ya una categoría literal, la respetamos
     for c in DEFAULT_CATEGORIES:
         if c.lower() in t:
             return c
-    # heurística básica por keywords (opcional, puedes quitarlo si no quieres)
+
+    # heurística por keywords
     if any(k in t for k in ["metro", "uber", "bus", "renfe", "taxi"]):
         return "Transporte"
     if any(k in t for k in ["mercadona", "carrefour", "aldi", "lidl", "super", "compra"]):
@@ -450,8 +421,9 @@ def _pick_category(text: str) -> str:
 
 def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
     """
-    Intenta sacar: fecha + descripción + importe + categoría + extra
-    - Si el OCR viene por líneas con info dispersa, lo agrupa por proximidad.
+    Saca items intentando:
+    - detectar líneas con importe
+    - asignarles fecha cercana (misma línea o hasta 4 líneas arriba)
     """
     raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     if not raw_lines:
@@ -459,47 +431,40 @@ def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
 
     items: List[ParsedExpenseItem] = []
 
-    # Estrategia:
-    # 1) detecta líneas que tengan importe => candidato a item
-    # 2) para cada candidato, busca fecha cerca (misma línea o líneas anteriores)
-    # 3) limpia descripción quitando fecha/importe/categoría
     for i, ln in enumerate(raw_lines):
         amount = _find_amount(ln)
         if amount is None:
             continue
 
-        # Buscar fecha en la misma línea o hasta 3 líneas hacia arriba
+        # fecha: misma línea o hacia arriba
         date_iso = _normalize_date(ln)
         if not date_iso:
-            for j in range(max(0, i - 3), i):
+            for j in range(i - 1, max(-1, i - 5), -1):
                 date_iso = _normalize_date(raw_lines[j])
                 if date_iso:
                     break
         if not date_iso:
-            date_iso = _today_iso()
+            date_iso = _today_iso_midnight()
 
-        # Categoría
         cat = _pick_category(ln)
 
-        # Descripción y extra
         desc = ln
 
-        # quita fecha si existe
+        # quita fechas
         desc = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", desc)
         desc = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", "", desc)
 
         # quita importe
         desc = re.sub(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?", "", desc)
 
-        # quita la categoría escrita (si estaba)
-        desc = desc.replace(cat, "").strip(" -:\t")
+        # quita categoria literal si aparece
+        desc = desc.replace(cat, "")
 
+        desc = desc.strip(" -:\t")
         if not desc:
-            # si la línea del importe era muy “seca”, usa algo de líneas previas como descripción
             prev = raw_lines[i - 1] if i - 1 >= 0 else ""
-            desc = prev[:120] if prev else "Gasto"
+            desc = prev.strip()[:120] if prev else "Gasto"
 
-        # extra: si hay “ - ” o “ | ” lo que quede al final
         extra = ""
         if " - " in ln:
             parts = ln.split(" - ", 1)
@@ -513,16 +478,16 @@ def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
                 amount=abs(float(amount)),
                 category=cat[:64],
                 extra=extra,
-                confidence=0.35,
+                confidence=0.45,
             )
         )
 
-    # Si no encontró ninguna línea con importe, intenta un único item del texto entero
+    # fallback: si no encontró líneas con importe, intenta un único item global
     if not items:
         amount = _find_amount(text)
         if amount is None:
             return []
-        date_iso = _normalize_date(text) or _today_iso()
+        date_iso = _normalize_date(text) or _today_iso_midnight()
         cat = _pick_category(text)
         desc = (text.strip()[:120] if text.strip() else "Gasto")
         items = [
@@ -540,22 +505,13 @@ def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
 
 
 def _detect_image_kind(data: bytes) -> str:
-    """
-    Detecta jpg/png/webp por magic bytes.
-    Devuelve: 'jpeg' | 'png' | 'webp' | ''
-    """
     if not data or len(data) < 12:
         return ""
 
-    # JPEG: FF D8 FF
     if data[:3] == b"\xff\xd8\xff":
         return "jpeg"
-
-    # PNG: 89 50 4E 47 0D 0A 1A 0A
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "png"
-
-    # WEBP: "RIFF....WEBP"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
 
@@ -592,6 +548,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # =========================
 # AUTH
@@ -770,6 +727,7 @@ def add_expenses_bulk(payload: List[ExpenseIn], user: User = Depends(get_current
         dt = datetime.utcnow()
         if p.date:
             dt = datetime.fromisoformat(p.date)
+
         e = Expense(
             user_id=user.id,
             date=dt,
@@ -868,24 +826,17 @@ def parse_text(payload: ParseTextRequest, user: User = Depends(get_current_user)
     return {"items": items}
 
 
-@app.post("/parse/image")
+@app.post("/parse/image", response_model=ParseResponse)
 async def parse_image(file: UploadFile = File(...), user: User = Depends(get_current_user)):
-    # Leemos bytes UNA vez
     data = await file.read()
 
-    # Detecta formato por magic bytes (y si falla, por extensión)
-    kind = _detect_image_kind(data)
-    if not kind:
-        kind = _ext_from_filename(file.filename or "")
-
+    kind = _detect_image_kind(data) or _ext_from_filename(file.filename or "")
     if kind not in ("jpeg", "png", "webp"):
         raise HTTPException(status_code=400, detail="Formato no soportado (jpeg/png/webp)")
 
     if OCR_PROVIDER != "ocrspace":
         raise HTTPException(status_code=503, detail="OCR no configurado (OCR_PROVIDER!=ocrspace)")
 
-    # Importante: como ya leímos file.read(), recreamos un "UploadFile lógico"
-    # para ocr_via_ocrspace: le pasamos el contenido directamente con un wrapper simple.
     class _MemUpload:
         def __init__(self, filename, content_type, content_bytes):
             self.filename = filename
@@ -895,7 +846,11 @@ async def parse_image(file: UploadFile = File(...), user: User = Depends(get_cur
         async def read(self):
             return self._b
 
-    mem = _MemUpload(file.filename or f"image.{kind}", file.content_type or "application/octet-stream", data)
+    mem = _MemUpload(
+        file.filename or f"image.{kind}",
+        file.content_type or "application/octet-stream",
+        data,
+    )
 
     text_out = await ocr_via_ocrspace(mem)
 

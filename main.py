@@ -419,89 +419,109 @@ def _pick_category(text: str) -> str:
     return DEFAULT_CATEGORIES[0]
 
 
+def _is_date_token(tok: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", tok.strip()))
+
+def _normalize_date_from_token(tok: str) -> Optional[str]:
+    # tok: "02/02/2026" or "2-2-26"
+    return _normalize_date(tok)
+
+def _is_amount_token(tok: str) -> bool:
+    t = tok.strip().replace("€", "")
+    # evita tokens de fecha
+    if "/" in t or "-" in t:
+        return False
+    return bool(re.fullmatch(r"-?\d+(?:[.,]\d{1,2})?", t))
+
+def _parse_amount_token(tok: str) -> Optional[float]:
+    t = tok.strip().replace("€", "").replace(",", ".")
+    try:
+        return float(t)
+    except Exception:
+        return None
+
 def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
     """
-    Saca items intentando:
-    - detectar líneas con importe
-    - asignarles fecha cercana (misma línea o hasta 4 líneas arriba)
+    Parser robusto para OCR de tablas/Excel:
+    - Mantiene fecha "actual" si una línea trae fecha y las siguientes no.
+    - El importe = último token numérico (no el día de la fecha).
+    - Soporta descripciones partidas en varias líneas.
     """
     raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     if not raw_lines:
         return []
 
     items: List[ParsedExpenseItem] = []
+    current_date_iso: Optional[str] = None
+    pending_desc_parts: List[str] = []
 
-    for i, ln in enumerate(raw_lines):
-        amount = _find_amount(ln)
-        if amount is None:
+    for ln in raw_lines:
+        # normaliza espacios
+        ln = re.sub(r"\s+", " ", ln).strip()
+        tokens = ln.split(" ")
+
+        # 1) Si la línea empieza por fecha, actualiza current_date
+        if tokens and _is_date_token(tokens[0]):
+            d_iso = _normalize_date_from_token(tokens[0])
+            if d_iso:
+                current_date_iso = d_iso
+            tokens = tokens[1:]  # quita la fecha del resto
+
+        # 2) Busca el último token que sea importe
+        amount_idx = None
+        amount_val = None
+        for idx in range(len(tokens) - 1, -1, -1):
+            if _is_amount_token(tokens[idx]):
+                v = _parse_amount_token(tokens[idx])
+                if v is not None:
+                    amount_idx = idx
+                    amount_val = abs(float(v))
+                    break
+
+        # 3) Si NO hay importe, probablemente es una continuación de descripción
+        if amount_idx is None or amount_val is None:
+            # acumula texto como parte de descripción
+            if tokens:
+                pending_desc_parts.append(" ".join(tokens))
             continue
 
-        # fecha: misma línea o hacia arriba
-        date_iso = _normalize_date(ln)
-        if not date_iso:
-            for j in range(i - 1, max(-1, i - 5), -1):
-                date_iso = _normalize_date(raw_lines[j])
-                if date_iso:
-                    break
-        if not date_iso:
-            date_iso = _today_iso_midnight()
+        # 4) Tenemos importe -> construimos item
+        before_amount = tokens[:amount_idx]
+        after_amount = tokens[amount_idx + 1 :]
 
-        cat = _pick_category(ln)
+        # descripción = (lo pendiente de líneas anteriores) + (lo de esta línea antes del importe)
+        desc = " ".join([*pending_desc_parts, " ".join(before_amount)]).strip()
+        pending_desc_parts = []  # reset
 
-        desc = ln
-
-        # quita fechas
-        desc = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", desc)
-        desc = re.sub(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", "", desc)
-
-        # quita importe
-        desc = re.sub(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?", "", desc)
-
-        # quita categoria literal si aparece
-        desc = desc.replace(cat, "")
-
-        desc = desc.strip(" -:\t")
         if not desc:
-            prev = raw_lines[i - 1] if i - 1 >= 0 else ""
-            desc = prev.strip()[:120] if prev else "Gasto"
+            desc = "Gasto"
 
-        extra = ""
-        if " - " in ln:
-            parts = ln.split(" - ", 1)
-            if len(parts) == 2:
-                extra = parts[1].strip()[:120]
+        # categoría: intenta detectar por lista conocida, si no, usa heurística/primera palabra de after_amount
+        # Si after_amount contiene una categoría EXACTA (por ejemplo "Suscripciones"), respétala.
+        cat = _pick_category(" ".join(after_amount) + " " + desc)
+
+        # Si hay algo después del importe, úsalo como extra (sin duplicar la categoría)
+        extra = " ".join(after_amount).strip()
+        if extra:
+            # si la categoría aparece dentro del extra, la quitamos del extra para que no repita
+            extra = re.sub(re.escape(cat), "", extra, flags=re.IGNORECASE).strip(" -:\t")
+
+        date_iso = current_date_iso or _today_iso_midnight()
 
         items.append(
             ParsedExpenseItem(
                 date=date_iso,
                 description=desc[:120],
-                amount=abs(float(amount)),
+                amount=amount_val,
                 category=cat[:64],
-                extra=extra,
-                confidence=0.45,
+                extra=extra[:120],
+                confidence=0.65,
             )
         )
 
-    # fallback: si no encontró líneas con importe, intenta un único item global
-    if not items:
-        amount = _find_amount(text)
-        if amount is None:
-            return []
-        date_iso = _normalize_date(text) or _today_iso_midnight()
-        cat = _pick_category(text)
-        desc = (text.strip()[:120] if text.strip() else "Gasto")
-        items = [
-            ParsedExpenseItem(
-                date=date_iso,
-                description=desc,
-                amount=abs(float(amount)),
-                category=cat,
-                extra="",
-                confidence=0.20,
-            )
-        ]
-
+    # Si quedaron descripciones pendientes sin importe, se ignoran (normal)
     return items
+
 
 
 def _detect_image_kind(data: bytes) -> str:

@@ -24,16 +24,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
-# ============================================================
-# OCR (Render FREE): OCR.space
-# - NO PaddleOCR (evita SIGTERM / RAM / descargas)
-# - Actívalo con: OCR_PROVIDER=ocrspace
-# - Requiere: OCRSPACE_API_KEY
-# - Idioma: OCR_LANG=spa (por defecto)
-# ============================================================
+# =========================
+# OCR (OCR.space)
+# =========================
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "none").lower()
 OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
-OCR_LANG = os.getenv("OCR_LANG", "spa")  # OCR.space: "spa" (español), "eng" (inglés), etc.
+OCR_LANG = os.getenv("OCR_LANG", "spa")  # OCR.space usa: spa, eng, etc.
 
 async def ocr_via_ocrspace(file: UploadFile) -> str:
     if not OCRSPACE_API_KEY:
@@ -46,11 +42,15 @@ async def ocr_via_ocrspace(file: UploadFile) -> str:
         "apikey": OCRSPACE_API_KEY,
         "language": OCR_LANG,
         "isOverlayRequired": "false",
-        "OCREngine": "2",  # suele ir mejor
-        # "detectOrientation": "true",  # opcional
+        "OCREngine": "2",
     }
+
     files = {
-        "filename": (file.filename or "image.jpg", content, file.content_type or "application/octet-stream")
+        "filename": (
+            file.filename or "image.jpg",
+            content,
+            file.content_type or "application/octet-stream",
+        )
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
@@ -61,7 +61,6 @@ async def ocr_via_ocrspace(file: UploadFile) -> str:
 
     j = r.json()
 
-    # OCR.space => ParsedResults[0].ParsedText
     try:
         parsed_results = j.get("ParsedResults", [])
         if not parsed_results:
@@ -79,7 +78,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-SECRET_KEY = os.getenv("SECRET_KEY", "s8d9f7sdf8s7df98s7df9sdf7sdf98s7df9s8df")
+SECRET_KEY = os.getenv("SECRET_KEY", "change_me")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30  # 30 días
 
@@ -108,10 +107,8 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
-# =========================
-# MIGRACIÓN SIMPLE (email)
-# =========================
 def ensure_schema():
+    """Migración simple: añadir email si no existe"""
     with engine.begin() as conn:
         dialect = engine.dialect.name
 
@@ -341,7 +338,7 @@ def expense_to_out(e: Expense) -> ExpenseOut:
     )
 
 
-def _today_iso() -> str:
+def _today_iso():
     return datetime.utcnow().isoformat()
 
 
@@ -355,9 +352,6 @@ def _simple_amount_guess(text: str):
 amount_anywhere_re = re.compile(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?")
 
 def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
-    """
-    Fallback rápido: saca items por líneas que contengan importes.
-    """
     items: List[ParsedExpenseItem] = []
     clean = []
     for ln in lines:
@@ -367,6 +361,7 @@ def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
         clean.append(s)
 
     for ln in clean:
+        # pillamos el primer importe que aparezca
         m = amount_anywhere_re.search(ln)
         if not m:
             continue
@@ -388,43 +383,69 @@ def _fallback_items_from_text(lines: List[str]) -> List[ParsedExpenseItem]:
                 amount=abs(amount),
                 category=DEFAULT_CATEGORIES[0],
                 extra="",
-                confidence=0.25,
+                confidence=0.20,
             )
         )
     return items
 
 
-def parse_text_to_items(text_in: str) -> List[ParsedExpenseItem]:
+def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
     """
     Convierte texto (OCR o dictado) en items.
-    - Si hay una sola línea: intenta sacar un importe y crea 1 item.
-    - Si hay varias líneas: usa fallback por líneas con importes.
+    Ahora mismo: fallback robusto -> busca importes por línea.
     """
-    txt = (text_in or "").strip()
-    if not txt:
-        return []
-
-    lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
-
-    # Caso 1: texto corto => 1 item con "best effort"
-    if len(lines) <= 1:
-        amount = _simple_amount_guess(txt)
-        if amount is None:
-            return []
-        return [
-            ParsedExpenseItem(
-                date=_today_iso(),
-                description=txt[:120],
-                amount=float(amount),
-                category=DEFAULT_CATEGORIES[0],
-                extra="",
-                confidence=0.35,
-            )
-        ]
-
-    # Caso 2: varias líneas => varios items si hay importes
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     items = _fallback_items_from_text(lines)
+
+    # Si no sacó nada por líneas, intenta sacar un importe suelto del texto completo
+    if not items:
+        amount = _simple_amount_guess(text)
+        if amount is not None:
+            items = [
+                ParsedExpenseItem(
+                    date=_today_iso(),
+                    description=(text.strip()[:120] if text.strip() else "Gasto"),
+                    amount=float(amount),
+                    category=DEFAULT_CATEGORIES[0],
+                    extra="",
+                    confidence=0.15,
+                )
+            ]
     return items
+
+
+def _detect_image_kind(data: bytes) -> str:
+    """
+    Detecta jpg/png/webp por magic bytes.
+    Devuelve: 'jpeg' | 'png' | 'webp' | ''
+    """
+    if not data or len(data) < 12:
+        return ""
+
+    # JPEG: FF D8 FF
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+
+    # PNG: 89 50 4E 47 0D 0A 1A 0A
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+
+    # WEBP: "RIFF....WEBP"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+
+    return ""
+
+
+def _ext_from_filename(name: str) -> str:
+    name = (name or "").lower().strip()
+    if name.endswith(".jpg") or name.endswith(".jpeg"):
+        return "jpeg"
+    if name.endswith(".png"):
+        return "png"
+    if name.endswith(".webp"):
+        return "webp"
+    return ""
 
 
 # =========================
@@ -722,18 +743,36 @@ def parse_text(payload: ParseTextRequest, user: User = Depends(get_current_user)
     return {"items": items}
 
 
-@app.post("/parse/image", response_model=ParseResponse)
-async def parse_image(
-    file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
-):
-    if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
+@app.post("/parse/image")
+async def parse_image(file: UploadFile = File(...), user: User = Depends(get_current_user)):
+    # Leemos bytes UNA vez
+    data = await file.read()
+
+    # Detecta formato por magic bytes (y si falla, por extensión)
+    kind = _detect_image_kind(data)
+    if not kind:
+        kind = _ext_from_filename(file.filename or "")
+
+    if kind not in ("jpeg", "png", "webp"):
         raise HTTPException(status_code=400, detail="Formato no soportado (jpeg/png/webp)")
 
     if OCR_PROVIDER != "ocrspace":
-        raise HTTPException(status_code=503, detail="OCR desactivado (OCR_PROVIDER!=ocrspace)")
+        raise HTTPException(status_code=503, detail="OCR no configurado (OCR_PROVIDER!=ocrspace)")
 
-    text_out = await ocr_via_ocrspace(file)
+    # Importante: como ya leímos file.read(), recreamos un "UploadFile lógico"
+    # para ocr_via_ocrspace: le pasamos el contenido directamente con un wrapper simple.
+    class _MemUpload:
+        def __init__(self, filename, content_type, content_bytes):
+            self.filename = filename
+            self.content_type = content_type
+            self._b = content_bytes
+
+        async def read(self):
+            return self._b
+
+    mem = _MemUpload(file.filename or f"image.{kind}", file.content_type or "application/octet-stream", data)
+
+    text_out = await ocr_via_ocrspace(mem)
 
     if not text_out.strip():
         return {"items": []}

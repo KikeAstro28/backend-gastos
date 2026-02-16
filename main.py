@@ -1,5 +1,6 @@
 import os
 import re
+import json
 from datetime import datetime, timedelta
 from typing import List, Optional
 from urllib.parse import unquote
@@ -34,140 +35,258 @@ OCR_LANG = os.getenv("OCR_LANG", "spa")  # OCR.space usa: spa, eng, etc.
 
 
 # =========================
-# AI (OpenAI) - estructurar OCR -> items
+# AI (estructurar OCR -> items)
+#   - AI_PROVIDER = "ollama" (local)  o  "openai" (cloud)  o  "none"
 # =========================
 AI_PROVIDER = os.getenv("AI_PROVIDER", "none").lower()
+
+# OpenAI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# Ollama (local)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
+
+
+def _extract_json_block(s: str) -> str:
+    """
+    Intenta recuperar el primer bloque JSON (objeto o array) del texto.
+    """
+    s = (s or "").strip()
+    if s.startswith("{") or s.startswith("["):
+        return s
+
+    start_obj = s.find("{")
+    start_arr = s.find("[")
+    starts = [x for x in (start_obj, start_arr) if x != -1]
+    if not starts:
+        return ""
+    start = min(starts)
+    return s[start:]
+
 
 async def ai_parse_items_from_text(raw_text: str, allowed_categories: List[str]) -> List["ParsedExpenseItem"]:
     """
     Convierte texto OCR (sucio) en items estructurados usando IA.
     Devuelve lista ParsedExpenseItem con date ISO "YYYY-MM-DDT00:00:00".
+
+    - Si AI_PROVIDER == "ollama": usa /api/chat en OLLAMA_BASE_URL
+    - Si AI_PROVIDER == "openai": usa Responses API (Structured Output)
+    - Si AI_PROVIDER == "none": devuelve []
     """
-    if AI_PROVIDER != "openai":
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
         return []
 
-    if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+    if AI_PROVIDER == "ollama":
+        system = (
+            "Eres un asistente que convierte texto OCR de gastos en items estructurados.\n"
+            "Devuelve SOLO JSON válido (sin markdown).\n"
+            "Formato exacto:\n"
+            "{ \"items\": ["
+            "{\"date\":\"YYYY-MM-DDT00:00:00\",\"description\":\"...\",\"amount\":12.34,"
+            "\"category\":\"...\",\"extra\":\"...\",\"confidence\":0.0}"
+            "] }\n"
+            "Reglas:\n"
+            "- Separa cada gasto en un item distinto.\n"
+            "- NO juntes varias descripciones en un solo item.\n"
+            "- date: si viene dd/mm/yyyy conviértelo a YYYY-MM-DDT00:00:00.\n"
+            "- Si falta fecha, usa la fecha de HOY con T00:00:00.\n"
+            "- amount: siempre número con punto decimal.\n"
+            "- category: debe ser EXACTAMENTE una de las categorías permitidas.\n"
+            "- extra: puede ser \"\".\n"
+        )
 
-    # JSON Schema estricto (Structured Outputs)
-    schema = {
-        "name": "parsed_expenses",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "items": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "date": {"type": "string"},        # "YYYY-MM-DDT00:00:00"
-                            "description": {"type": "string"},
-                            "amount": {"type": "number"},
-                            "category": {"type": "string"},
-                            "extra": {"type": "string"},
-                            "confidence": {"type": "number"},
-                        },
-                        "required": ["date", "description", "amount", "category", "extra", "confidence"],
-                    },
-                }
-            },
-            "required": ["items"],
-        },
-    }
+        user_prompt = (
+            "Categorías permitidas:\n"
+            + "\n".join(f"- {c}" for c in allowed_categories)
+            + "\n\nTexto OCR:\n"
+            + raw_text
+        )
 
-    system = (
-        "Eres un extractor de gastos. A partir de texto OCR (posiblemente desordenado), "
-        "devuelve SOLO JSON válido que cumpla el esquema. "
-        "Reglas:\n"
-        "- date SIEMPRE en formato ISO: YYYY-MM-DDT00:00:00\n"
-        "- amount en euros (float)\n"
-        "- category debe ser UNA de las categorías permitidas\n"
-        "- extra puede ser '' si no hay\n"
-        "- No inventes importes.\n"
-        "- Si hay filas tipo Excel (fecha | descripción | importe | categoría | extra), respétalas.\n"
-    )
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "options": {"temperature": 0.1},
+        }
 
-    user = (
-        "CATEGORÍAS PERMITIDAS:\n"
-        + "\n".join(f"- {c}" for c in allowed_categories)
-        + "\n\n"
-        "TEXTO OCR:\n"
-        + raw_text
-    )
+        url = f"{OLLAMA_BASE_URL}/api/chat"
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                r = await client.post(url, json=payload)
+        except Exception:
+            return []
 
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": schema,
-        },
-    }
+        if r.status_code != 200:
+            return []
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+        data = r.json()
+        content = (((data or {}).get("message") or {}).get("content") or "").strip()
+        raw_json = _extract_json_block(content)
+        if not raw_json:
+            return []
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+        try:
+            obj = json.loads(raw_json)
+        except Exception:
+            return []
 
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OpenAI error {r.status_code}: {r.text}")
-
-    data = r.json()
-
-    # En Responses API, el contenido suele venir dentro de output_text o output[].content[]
-    # Para ir a lo seguro: buscamos el primer bloque de texto.
-    text_json = None
-    try:
-        # 1) output_text (si existe)
-        text_json = data.get("output_text")
-        if not text_json:
-            # 2) output -> content -> text
-            out = data.get("output", [])
-            for msg in out:
-                for c in msg.get("content", []):
-                    if c.get("type") in ("output_text", "text"):
-                        text_json = c.get("text")
-                        break
-                if text_json:
-                    break
-    except Exception:
-        text_json = None
-
-    if not text_json:
-        return []
-
-    try:
-        obj = __import__("json").loads(text_json)
         items = obj.get("items", [])
-        parsed: List[ParsedExpenseItem] = []
-        for it in items:
-            parsed.append(
-                ParsedExpenseItem(
-                    date=(it.get("date") or "").strip(),
-                    description=(it.get("description") or "").strip()[:120] or "Gasto",
-                    amount=float(it.get("amount") or 0),
-                    category=(it.get("category") or allowed_categories[0])[:64],
-                    extra=(it.get("extra") or "")[:120],
-                    confidence=float(it.get("confidence") or 0.5),
-                )
-            )
-        # Filtra basura
-        parsed = [p for p in parsed if p.amount > 0 and p.date]
-        return parsed
-    except Exception:
-        return []
+        out: List[ParsedExpenseItem] = []
 
+        for it in items:
+            try:
+                date = (it.get("date") or "").strip() or _today_iso_midnight()
+                desc = (it.get("description") or "Gasto").strip()
+                amount = float(it.get("amount"))
+                cat = (it.get("category") or allowed_categories[0]).strip()
+                if cat not in allowed_categories:
+                    cat = allowed_categories[0]
+                extra = (it.get("extra") or "").strip()
+                conf = float(it.get("confidence") or 0.7)
+
+                out.append(
+                    ParsedExpenseItem(
+                        date=date,
+                        description=desc[:120],
+                        amount=abs(amount),
+                        category=cat[:64],
+                        extra=extra[:120],
+                        confidence=max(0.0, min(conf, 1.0)),
+                    )
+                )
+            except Exception:
+                continue
+
+        # filtra basura
+        out = [p for p in out if p.amount > 0 and p.date]
+        return out
+
+    if AI_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+
+        # JSON Schema estricto (Structured Outputs)
+        schema = {
+            "name": "parsed_expenses",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "date": {"type": "string"},        # "YYYY-MM-DDT00:00:00"
+                                "description": {"type": "string"},
+                                "amount": {"type": "number"},
+                                "category": {"type": "string"},
+                                "extra": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["date", "description", "amount", "category", "extra", "confidence"],
+                        },
+                    }
+                },
+                "required": ["items"],
+            },
+        }
+
+        system = (
+            "Eres un extractor de gastos. A partir de texto OCR (posiblemente desordenado), "
+            "devuelve SOLO JSON válido que cumpla el esquema. "
+            "Reglas:\n"
+            "- date SIEMPRE en formato ISO: YYYY-MM-DDT00:00:00\n"
+            "- amount en euros (float)\n"
+            "- category debe ser UNA de las categorías permitidas\n"
+            "- extra puede ser '' si no hay\n"
+            "- Separa cada gasto en un item distinto.\n"
+            "- No inventes importes.\n"
+            "- Si hay filas tipo Excel (fecha | descripción | importe | categoría | extra), respétalas.\n"
+        )
+
+        user = (
+            "CATEGORÍAS PERMITIDAS:\n"
+            + "\n".join(f"- {c}" for c in allowed_categories)
+            + "\n\n"
+            "TEXTO OCR:\n"
+            + raw_text
+        )
+
+        payload = {
+            "model": OPENAI_MODEL,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": schema,
+            },
+        }
+
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"OpenAI error {r.status_code}: {r.text}")
+
+        data = r.json()
+
+        # Responses API: intenta localizar el texto JSON
+        text_json = None
+        try:
+            text_json = data.get("output_text")
+            if not text_json:
+                out = data.get("output", [])
+                for msg in out:
+                    for c in msg.get("content", []):
+                        if c.get("type") in ("output_text", "text"):
+                            text_json = c.get("text")
+                            break
+                    if text_json:
+                        break
+        except Exception:
+            text_json = None
+
+        if not text_json:
+            return []
+
+        try:
+            obj = json.loads(text_json)
+            items = obj.get("items", [])
+            parsed: List[ParsedExpenseItem] = []
+            for it in items:
+                parsed.append(
+                    ParsedExpenseItem(
+                        date=(it.get("date") or "").strip() or _today_iso_midnight(),
+                        description=(it.get("description") or "").strip()[:120] or "Gasto",
+                        amount=float(it.get("amount") or 0),
+                        category=(it.get("category") or allowed_categories[0])[:64],
+                        extra=(it.get("extra") or "")[:120],
+                        confidence=float(it.get("confidence") or 0.6),
+                    )
+                )
+            parsed = [p for p in parsed if p.amount > 0 and p.date]
+            return parsed
+        except Exception:
+            return []
+
+    # AI_PROVIDER == "none" o desconocido
+    return []
 
 
 async def ocr_via_ocrspace(file_like) -> str:
@@ -521,20 +640,10 @@ def _normalize_date(d: str) -> Optional[str]:
     return None
 
 
-def _find_amount(text: str) -> Optional[float]:
-    m = re.search(r"(-?\d+(?:[.,]\d{1,2})?)\s*€?", text or "")
-    if not m:
-        return None
-    try:
-        return float(m.group(1).replace(",", "."))
-    except Exception:
-        return None
-
-
 def _pick_category(text: str) -> str:
     t = (text or "").lower()
 
-    # si viene ya una categoría literal, la respetamos
+    # si viene ya una categoría literal, la respetamos (solo default aquí)
     for c in DEFAULT_CATEGORIES:
         if c.lower() in t:
             return c
@@ -559,16 +668,15 @@ def _pick_category(text: str) -> str:
 def _is_date_token(tok: str) -> bool:
     return bool(re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", tok.strip()))
 
-def _normalize_date_from_token(tok: str) -> Optional[str]:
-    # tok: "02/02/2026" or "2-2-26"
-    return _normalize_date(tok)
 
 def _is_amount_token(tok: str) -> bool:
     t = tok.strip().replace("€", "")
-    # evita tokens de fecha
-    if "/" in t or "-" in t:
+    # evita tokens que parezcan fecha
+    if "/" in t:
         return False
+    # el '-' puede aparecer en importes negativos, pero también en fechas; como arriba filtramos '/', aquí vale
     return bool(re.fullmatch(r"-?\d+(?:[.,]\d{1,2})?", t))
+
 
 def _parse_amount_token(tok: str) -> Optional[float]:
     t = tok.strip().replace("€", "").replace(",", ".")
@@ -577,9 +685,10 @@ def _parse_amount_token(tok: str) -> Optional[float]:
     except Exception:
         return None
 
+
 def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
     """
-    Parser robusto para OCR de tablas/Excel:
+    Fallback (sin IA): parser robusto para OCR de tablas/Excel:
     - Mantiene fecha "actual" si una línea trae fecha y las siguientes no.
     - El importe = último token numérico (no el día de la fecha).
     - Soporta descripciones partidas en varias líneas.
@@ -593,18 +702,17 @@ def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
     pending_desc_parts: List[str] = []
 
     for ln in raw_lines:
-        # normaliza espacios
         ln = re.sub(r"\s+", " ", ln).strip()
         tokens = ln.split(" ")
 
-        # 1) Si la línea empieza por fecha, actualiza current_date
+        # fecha al principio
         if tokens and _is_date_token(tokens[0]):
-            d_iso = _normalize_date_from_token(tokens[0])
+            d_iso = _normalize_date(tokens[0])
             if d_iso:
                 current_date_iso = d_iso
-            tokens = tokens[1:]  # quita la fecha del resto
+            tokens = tokens[1:]
 
-        # 2) Busca el último token que sea importe
+        # último token importe
         amount_idx = None
         amount_val = None
         for idx in range(len(tokens) - 1, -1, -1):
@@ -615,32 +723,24 @@ def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
                     amount_val = abs(float(v))
                     break
 
-        # 3) Si NO hay importe, probablemente es una continuación de descripción
         if amount_idx is None or amount_val is None:
-            # acumula texto como parte de descripción
             if tokens:
                 pending_desc_parts.append(" ".join(tokens))
             continue
 
-        # 4) Tenemos importe -> construimos item
         before_amount = tokens[:amount_idx]
         after_amount = tokens[amount_idx + 1 :]
 
-        # descripción = (lo pendiente de líneas anteriores) + (lo de esta línea antes del importe)
         desc = " ".join([*pending_desc_parts, " ".join(before_amount)]).strip()
-        pending_desc_parts = []  # reset
+        pending_desc_parts = []
 
         if not desc:
             desc = "Gasto"
 
-        # categoría: intenta detectar por lista conocida, si no, usa heurística/primera palabra de after_amount
-        # Si after_amount contiene una categoría EXACTA (por ejemplo "Suscripciones"), respétala.
         cat = _pick_category(" ".join(after_amount) + " " + desc)
 
-        # Si hay algo después del importe, úsalo como extra (sin duplicar la categoría)
         extra = " ".join(after_amount).strip()
         if extra:
-            # si la categoría aparece dentro del extra, la quitamos del extra para que no repita
             extra = re.sub(re.escape(cat), "", extra, flags=re.IGNORECASE).strip(" -:\t")
 
         date_iso = current_date_iso or _today_iso_midnight()
@@ -656,9 +756,7 @@ def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
             )
         )
 
-    # Si quedaron descripciones pendientes sin importe, se ignoran (normal)
     return items
-
 
 
 def _detect_image_kind(data: bytes) -> str:
@@ -684,6 +782,39 @@ def _ext_from_filename(name: str) -> str:
     if name.endswith(".webp"):
         return "webp"
     return ""
+
+
+def get_allowed_categories(user: User, db: Session) -> List[str]:
+    """
+    default + custom - hidden (sin duplicados, respetando orden)
+    """
+    custom_rows = (
+        db.query(Category)
+        .filter(Category.user_id == user.id)
+        .order_by(Category.name.asc())
+        .all()
+    )
+    custom = [r.name for r in custom_rows]
+
+    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
+    hidden = {r.name.strip().lower() for r in hidden_rows}
+
+    allowed: List[str] = []
+    seen = set()
+    for c in DEFAULT_CATEGORIES + custom:
+        k = (c or "").strip()
+        if not k:
+            continue
+        lk = k.lower()
+        if lk in hidden:
+            continue
+        if lk in seen:
+            continue
+        seen.add(lk)
+        allowed.append(k)
+
+    # fallback mínimo por si algo raro
+    return allowed or list(DEFAULT_CATEGORIES)
 
 
 # =========================
@@ -738,26 +869,7 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
 # =========================
 @app.get("/categories", response_model=List[str])
 def list_categories(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    rows = db.query(Category).filter(Category.user_id == user.id).order_by(Category.name.asc()).all()
-    custom = [r.name for r in rows]
-
-    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
-    hidden = {r.name.strip().lower() for r in hidden_rows}
-
-    out = []
-    seen = set()
-    for c in DEFAULT_CATEGORIES + custom:
-        k = c.strip()
-        if not k:
-            continue
-        if k.lower() in hidden:
-            continue
-        if k.lower() in seen:
-            continue
-        seen.add(k.lower())
-        out.append(k)
-
-    return out
+    return get_allowed_categories(user, db)
 
 
 @app.post("/categories")
@@ -903,7 +1015,12 @@ def add_expenses_bulk(payload: List[ExpenseIn], user: User = Depends(get_current
 
 
 @app.put("/expenses/{expense_id}", response_model=ExpenseOut)
-def update_expense(expense_id: int, payload: ExpenseUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def update_expense(
+    expense_id: int,
+    payload: ExpenseUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     e = (
         db.query(Expense)
         .filter(Expense.id == expense_id)
@@ -965,7 +1082,11 @@ def update_email(payload: UpdateEmailRequest, user: User = Depends(get_current_u
 
 
 @app.post("/me/change-password")
-def change_password(payload: ChangePasswordRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def change_password(
+    payload: ChangePasswordRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     if not verify_password(payload.current_password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Current password incorrect")
     user.hashed_password = hash_password(payload.new_password)
@@ -983,43 +1104,30 @@ async def parse_text(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # ✅ categorías permitidas (default + custom - hidden)
-    custom_rows = (
-        db.query(Category)
-        .filter(Category.user_id == user.id)
-        .order_by(Category.name.asc())
-        .all()
-    )
-    custom = [r.name for r in custom_rows]
+    allowed = get_allowed_categories(user, db)
 
-    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
-    hidden = {r.name.strip().lower() for r in hidden_rows}
+    # 1) IA primero (ollama/openai)
+    try:
+        ai_items = await ai_parse_items_from_text(payload.text, allowed)
+        if ai_items:
+            return {"items": ai_items}
+    except HTTPException:
+        # si OpenAI no está configurado, etc.
+        pass
+    except Exception:
+        pass
 
-    allowed = []
-    seen = set()
-    for c in DEFAULT_CATEGORIES + custom:
-        k = c.strip()
-        if not k:
-            continue
-        if k.lower() in hidden:
-            continue
-        if k.lower() in seen:
-            continue
-        seen.add(k.lower())
-        allowed.append(k)
-
-    # ✅ 1) IA primero
-    ai_items = await ai_parse_items_from_text(payload.text, allowed)
-    if ai_items:
-        return {"items": ai_items}
-
-    # ✅ 2) fallback regex
+    # 2) fallback heurístico
     items = parse_text_to_items(payload.text)
     return {"items": items}
 
 
 @app.post("/parse/image", response_model=ParseResponse)
-async def parse_image(file: UploadFile = File(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def parse_image(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     data = await file.read()
 
     kind = _detect_image_kind(data) or _ext_from_filename(file.filename or "")
@@ -1048,28 +1156,19 @@ async def parse_image(file: UploadFile = File(...), user: User = Depends(get_cur
     if not text_out.strip():
         return {"items": []}
 
-    # ✅ categorías permitidas (default + custom, sin hidden)
-    custom_rows = db.query(Category).filter(Category.user_id == user.id).order_by(Category.name.asc()).all()
-    custom = [r.name for r in custom_rows]
-    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
-    hidden = {r.name.strip().lower() for r in hidden_rows}
+    allowed = get_allowed_categories(user, db)
 
-    allowed = []
-    seen = set()
-    for c in DEFAULT_CATEGORIES + custom:
-        if c.lower() in hidden:
-            continue
-        if c.lower() in seen:
-            continue
-        seen.add(c.lower())
-        allowed.append(c)
+    # 1) IA primero (ollama/openai)
+    try:
+        ai_items = await ai_parse_items_from_text(text_out, allowed)
+        if ai_items:
+            return {"items": ai_items}
+    except HTTPException:
+        pass
+    except Exception:
+        pass
 
-    # ✅ 1) IA primero
-    ai_items = await ai_parse_items_from_text(text_out, allowed)
-    if ai_items:
-        return {"items": ai_items}
-
-    # ✅ 2) fallback (tu parser viejo)
+    # 2) fallback heurístico
     items = parse_text_to_items(text_out)
     return {"items": items}
 

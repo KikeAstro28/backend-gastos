@@ -685,60 +685,88 @@ def _parse_amount_token(tok: str) -> Optional[float]:
     except Exception:
         return None
 
+DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+
+def _explode_rows_by_dates(text: str) -> str:
+    """
+    Si OCR devuelve todo 'aplastado', intentamos reconstruir filas.
+    Inserta saltos de línea antes de cada fecha dd/mm/yyyy para que cada fila empiece en una línea.
+    """
+    if not text:
+        return ""
+    t = re.sub(r"\s+", " ", text).strip()  # aplanado controlado
+
+    # Si hay varias fechas, es muy probable que sea tabla
+    dates = DATE_RE.findall(t)
+    if len(dates) >= 2:
+        # salto de línea antes de cada fecha
+        t = DATE_RE.sub(lambda m: "\n" + m.group(0), t).strip()
+
+    return t
+
 
 def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
-    """
-    Fallback (sin IA): parser robusto para OCR de tablas/Excel:
-    - Mantiene fecha "actual" si una línea trae fecha y las siguientes no.
-    - El importe = último token numérico (no el día de la fecha).
-    - Soporta descripciones partidas en varias líneas.
-    """
     raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     if not raw_lines:
         return []
 
     items: List[ParsedExpenseItem] = []
     current_date_iso: Optional[str] = None
-    pending_desc_parts: List[str] = []
 
     for ln in raw_lines:
         ln = re.sub(r"\s+", " ", ln).strip()
         tokens = ln.split(" ")
+        if not tokens:
+            continue
 
-        # fecha al principio
-        if tokens and _is_date_token(tokens[0]):
+        # 1) fecha al principio (si está)
+        if _is_date_token(tokens[0]):
             d_iso = _normalize_date(tokens[0])
             if d_iso:
                 current_date_iso = d_iso
             tokens = tokens[1:]
+            ln_rest = " ".join(tokens).strip()
+        else:
+            ln_rest = " ".join(tokens).strip()
 
-        # último token importe
-        amount_idx = None
-        amount_val = None
-        for idx in range(len(tokens) - 1, -1, -1):
-            if _is_amount_token(tokens[idx]):
-                v = _parse_amount_token(tokens[idx])
-                if v is not None:
-                    amount_idx = idx
-                    amount_val = abs(float(v))
-                    break
-
-        if amount_idx is None or amount_val is None:
-            if tokens:
-                pending_desc_parts.append(" ".join(tokens))
+        if not ln_rest:
             continue
 
-        before_amount = tokens[:amount_idx]
-        after_amount = tokens[amount_idx + 1 :]
+        # 2) encuentra importe (buscando de derecha a izquierda)
+        amount_val = None
+        amount_pos = None
+        rest_tokens = ln_rest.split(" ")
+        for idx in range(len(rest_tokens) - 1, -1, -1):
+            if _is_amount_token(rest_tokens[idx]):
+                v = _parse_amount_token(rest_tokens[idx])
+                if v is not None:
+                    amount_val = abs(float(v))
+                    amount_pos = idx
+                    break
 
-        desc = " ".join([*pending_desc_parts, " ".join(before_amount)]).strip()
-        pending_desc_parts = []
+        if amount_val is None or amount_pos is None:
+            continue
 
+        before_amount = rest_tokens[:amount_pos]
+        after_amount = rest_tokens[amount_pos + 1:]
+
+        # 3) categoría: intenta encontrar una categoría EXACTA en after_amount o en toda la línea
+        cat = None
+        lower_line = (" ".join(after_amount) + " " + " ".join(before_amount)).lower()
+        for c in DEFAULT_CATEGORIES:
+            if c.lower() in lower_line:
+                cat = c
+                break
+        if not cat:
+            cat = _pick_category(ln_rest)
+
+        # 4) descripción: lo que va antes del importe, limpiando si contiene la categoría
+        desc = " ".join(before_amount).strip()
+        desc = re.sub(re.escape(cat), "", desc, flags=re.IGNORECASE).strip()
         if not desc:
             desc = "Gasto"
 
-        cat = _pick_category(" ".join(after_amount) + " " + desc)
-
+        # 5) extra: lo que queda después del importe, quitando categoría si se repite
         extra = " ".join(after_amount).strip()
         if extra:
             extra = re.sub(re.escape(cat), "", extra, flags=re.IGNORECASE).strip(" -:\t")
@@ -752,11 +780,12 @@ def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
                 amount=amount_val,
                 category=cat[:64],
                 extra=extra[:120],
-                confidence=0.65,
+                confidence=0.70,
             )
         )
 
     return items
+
 
 
 def _detect_image_kind(data: bytes) -> str:
@@ -1153,6 +1182,8 @@ async def parse_image(
     )
 
     text_out = await ocr_via_ocrspace(mem)
+    text_out = _explode_rows_by_dates(text_out)
+
     if not text_out.strip():
         return {"items": []}
 

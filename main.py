@@ -310,6 +310,38 @@ class ParseResponse(BaseModel):
 # =========================
 # HELPERS
 # =========================
+def _extract_json_obj(text: str) -> Optional[dict]:
+    """
+    Intenta extraer el primer objeto JSON válido de un texto.
+    Soporta respuestas con ```json ... ``` y texto extra.
+    """
+    if not text:
+        return None
+
+    t = text.strip()
+
+    # quita code fences si vienen
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s*```$", "", t)
+
+    # intento directo
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+
+    # busca primer {...} grande
+    start = t.find("{")
+    end = t.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = t[start : end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+
+    return None
+
 def get_db():
     db = SessionLocal()
     try:
@@ -452,49 +484,63 @@ def _limit_description(desc: str, extra: str) -> Tuple[str, str]:
 def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
     """
     PRE-PARSER robusto:
-    - Convierte el OCR en líneas “procesables”
-    - Si una línea contiene varias fechas (tabla pegada), la parte en trozos
-    - Detecta el último número como importe
-    - Hereda fecha para líneas siguientes sin fecha
+    - Divide cualquier línea que contenga múltiples fechas en trozos (sin tocar la lista mientras iteras).
+    - Detecta fecha en cualquier posición, no solo al principio.
+    - Detecta importe como último número válido (evitando confundir día/mes).
     """
-    raw_lines = [ln.strip() for ln in (ocr_text or "").splitlines() if ln.strip()]
+    text = (ocr_text or "").strip()
+    if not text:
+        return []
+
+    # 1) Normaliza y parte en líneas
+    raw_lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines() if ln.strip()]
     if not raw_lines:
         return []
 
-    # 1) Normaliza y “explota” líneas que traen varias fechas dentro
-    lines: List[str] = []
-    date_re = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+    # 2) Si una línea tiene varias fechas, la partimos por cada fecha encontrada
+    expanded_lines: List[str] = []
+    date_pat = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
 
     for ln in raw_lines:
-        ln = _clean_spaces(ln)
-        hits = list(date_re.finditer(ln))
-        if len(hits) <= 1:
-            lines.append(ln)
-        else:
-            # corta antes de cada fecha (excepto la primera)
-            for i, m in enumerate(hits):
-                start = m.start()
-                end = hits[i + 1].start() if i + 1 < len(hits) else len(ln)
-                chunk = ln[start:end].strip()
-                if chunk:
-                    lines.append(chunk)
+        matches = list(date_pat.finditer(ln))
+        if len(matches) <= 1:
+            expanded_lines.append(ln)
+            continue
 
-    # 2) parseo a candidatos
+        # trozos: desde cada fecha hasta la siguiente fecha
+        for i, m in enumerate(matches):
+            start = m.start()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(ln)
+            chunk = ln[start:end].strip()
+            if chunk:
+                expanded_lines.append(chunk)
+
     candidates: List[dict] = []
     current_date_iso: Optional[str] = None
     pending_parts: List[str] = []
 
-    for ln in lines:
+    for ln in expanded_lines:
+        ln = re.sub(r"\s+", " ", ln).strip()
+        if not ln:
+            continue
+
         tokens = ln.split(" ")
 
-        # fecha al inicio
-        if tokens and _is_date_token(tokens[0]):
-            d_iso = _normalize_date(tokens[0])
-            if d_iso:
-                current_date_iso = d_iso
-            tokens = tokens[1:]
+        # 3) Busca una fecha en cualquier posición (normalmente al inicio, pero OCR a veces la mueve)
+        found_date_iso = None
+        date_idx = None
+        for idx, tok in enumerate(tokens[:4]):  # normalmente aparece al principio; limitamos para no liarla
+            if re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", tok):
+                found_date_iso = _normalize_date(tok)
+                date_idx = idx
+                break
 
-        # busca último token numérico como importe
+        if found_date_iso:
+            current_date_iso = found_date_iso
+            # quita ese token fecha
+            tokens = tokens[:date_idx] + tokens[date_idx + 1 :]
+
+        # 4) Busca el último token que sea importe real
         amount_idx = None
         amount_val = None
         for idx in range(len(tokens) - 1, -1, -1):
@@ -505,10 +551,9 @@ def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
                     amount_val = float(v)
                     break
 
-        # si no hay importe -> es continuación
-        if amount_idx is None:
-            if tokens:
-                pending_parts.append(" ".join(tokens))
+        # si no hay importe, lo tratamos como continuación de texto
+        if amount_idx is None or amount_val is None:
+            pending_parts.append(" ".join(tokens))
             continue
 
         before_amount = tokens[:amount_idx]
@@ -598,7 +643,10 @@ async def ai_refine_candidates(
         data = r.json()
         content = (data.get("message") or {}).get("content") or ""
         try:
-            obj = json.loads(content)
+            obj = _extract_json_obj(content)
+            if not obj:
+                return []
+
         except Exception:
             return []
 
@@ -773,7 +821,10 @@ async def ai_refine_candidates(
         content = data["choices"][0]["message"]["content"]
 
         try:
-            obj = json.loads(content)
+            obj = _extract_json_obj(content)
+            if not obj:
+                return []
+
         except Exception:
             return []
 
@@ -793,7 +844,17 @@ async def ai_refine_candidates(
                 cat2 = _pick_category_from_text(base.get("raw", ""), allowed_categories)
                 cat = cat2 or (allowed_categories[0] if allowed_categories else "Desayuno/Fuera")
 
-            desc = (it.get("description") or "").strip() or "Gasto"
+            desc = (it.get("description") or "").strip()
+            if not desc:
+                # si IA no dio descripción, la sacamos del raw del candidato
+                base_raw = (base.get("raw") or "").strip()
+                # quita la categoría si aparece
+                if cat:
+                    base_raw = re.sub(re.escape(cat), "", base_raw, flags=re.IGNORECASE).strip(" -:\t")
+                # deja primeras 6-8 palabras
+                words = base_raw.split()
+                desc = " ".join(words[:8]).strip() if words else "Gasto"
+
             extra = (it.get("extra") or "").strip()
 
             desc, extra = _limit_description(desc, extra)
@@ -812,6 +873,7 @@ async def ai_refine_candidates(
         # si devuelve muy pocos items, consideramos fallo y hacemos fallback
         if len(out) < max(1, int(0.7 * len(candidates))):
             return []
+        print("✅ GROQ items devueltos =", len(out), "de", len(candidates))
 
         return out
 

@@ -630,6 +630,56 @@ def _group_words_by_rows(words: list[dict], y_tol: int = 12) -> list[list[dict]]
     for row in rows:
         row.sort(key=lambda w: w["left"])
     return rows
+def _is_int_1_2(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,2}", (s or "").strip()))
+
+def _is_year(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{4}", (s or "").strip()))
+
+def _row_find_date_indices(row: list[dict]) -> tuple[Optional[str], set[int]]:
+    """
+    Detecta fecha aunque venga partida en tokens: 02 / 02 / 2026
+    Devuelve (date_iso, indices_usados_en_row)
+    """
+    toks = [w["text"].strip() for w in row]
+    n = len(toks)
+
+    # Caso 1: token completo dd/mm/yyyy (ya lo tenías)
+    for i, t in enumerate(toks):
+        if _is_date_str(t):
+            d_iso = _normalize_date(t)
+            if d_iso:
+                return d_iso, {i}
+
+    # Caso 2: dd / mm / yyyy (partido)
+    # patrones posibles: dd, '/', mm, '/', yyyy  OR dd, mm, yyyy (sin '/')
+    for i in range(n):
+        # dd / mm / yyyy
+        if i + 4 < n and _is_int_1_2(toks[i]) and toks[i+1] in ("/", "-") and _is_int_1_2(toks[i+2]) and toks[i+3] in ("/", "-") and _is_year(toks[i+4]):
+            dd = toks[i].zfill(2)
+            mm = toks[i+2].zfill(2)
+            yyyy = toks[i+4]
+            return f"{yyyy}-{mm}-{dd}T00:00:00", {i, i+1, i+2, i+3, i+4}
+
+        # dd / mm /  (y el año suelto cerca, típico OCR)
+        if i + 3 < n and _is_int_1_2(toks[i]) and toks[i+1] in ("/", "-") and _is_int_1_2(toks[i+2]) and toks[i+3] in ("/", "-"):
+            # busca año en los siguientes 6 tokens
+            for j in range(i+4, min(n, i+10)):
+                if _is_year(toks[j]):
+                    dd = toks[i].zfill(2)
+                    mm = toks[i+2].zfill(2)
+                    yyyy = toks[j]
+                    used = {i, i+1, i+2, i+3, j}
+                    return f"{yyyy}-{mm}-{dd}T00:00:00", used
+
+        # dd mm yyyy (sin separadores)
+        if i + 2 < n and _is_int_1_2(toks[i]) and _is_int_1_2(toks[i+1]) and _is_year(toks[i+2]):
+            dd = toks[i].zfill(2)
+            mm = toks[i+1].zfill(2)
+            yyyy = toks[i+2]
+            return f"{yyyy}-{mm}-{dd}T00:00:00", {i, i+1, i+2}
+
+    return None, set()
 
 def extract_items_from_overlay(
     ocr_json: dict,
@@ -650,12 +700,11 @@ def extract_items_from_overlay(
     for row in rows:
         texts = [w["text"] for w in row]
 
-        # detecta fecha en la fila
-        date_tok = next((t for t in texts if _is_date_str(t)), None)
-        if date_tok:
-            d_iso = _normalize_date(date_tok)
-            if d_iso:
-                current_date_iso = d_iso
+        # detecta fecha en la fila (aunque venga partida)
+        d_iso, used_idx = _row_find_date_indices(row)
+        if d_iso:
+            current_date_iso = d_iso
+
 
         # detecta importes (candidatos)
         money_words = []
@@ -672,16 +721,34 @@ def extract_items_from_overlay(
         money_words.sort(key=lambda t: t[0]["left"])
         amount_word, amount_val = money_words[-1]
 
-        # descripción = palabras claramente a la izquierda del importe
-        left_words = [w for w in row if w["left"] + w["width"] <= amount_word["left"] - 8]
+        left_words_all = [w for w in row if w["left"] + w["width"] <= amount_word["left"] - 8]
+
+        # elimina tokens de fecha (índices used_idx) y separadores sueltos "/"
+        left_words = []
+        for idx, w in enumerate(row):
+            if w not in left_words_all:
+                continue
+            if idx in used_idx:
+                continue
+            if w["text"].strip() in ("/", "-"):
+                continue
+            left_words.append(w)
+
         left_text = " ".join(w["text"] for w in left_words).strip()
+        left_text = _clean_spaces(left_text)
 
-        # quita fecha de la descripción si se coló
-        left_text = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", "", left_text).strip()
+        # description SIEMPRE sale de lo de la izquierda (sin fecha)
+        desc = left_text or "Gasto"
 
-        # si no hay nada a la izquierda, intenta “arriba” (fila anterior cercana)
-        desc = left_text
+        # regla: max 4 palabras en description; el resto al extra (si quieres)
         extra = ""
+        parts = desc.split()
+        if len(parts) > 4:
+            extra = " ".join(parts[4:])[:120]
+            desc = " ".join(parts[:4])
+
+        desc = desc[:120]
+
 
         if not desc:
             desc = "Gasto"
@@ -710,6 +777,8 @@ def extract_items_from_overlay(
                 confidence=0.80,
             )
         )
+    print("ROW ->", [w["text"] for w in row])
+    print("DATE ->", date_iso, "DESC ->", desc, "AMOUNT ->", amount_val)
 
     return items
 

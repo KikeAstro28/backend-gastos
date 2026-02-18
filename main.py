@@ -565,11 +565,29 @@ def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
     return candidates
 
 def _is_money_str(s: str) -> bool:
-    s = (s or "").strip().replace("€", "").replace(",", ".")
-    # evita cosas tipo 02/02/2026
+    s0 = (s or "").strip()
+    if not s0:
+        return False
+
+    # quita símbolo y normaliza
+    s = s0.replace("€", "").strip().replace(",", ".")
+
+    # evita fechas
     if "/" in s or "-" in s:
         return False
+
+    # evita años sueltos tipo 2026
+    if re.fullmatch(r"\d{4}", s):
+        try:
+            y = int(s)
+            if 1900 <= y <= 2100:
+                return False
+        except Exception:
+            pass
+
+    # Acepta: 27.00, 9.9, 10, 1.80 (pero luego filtramos >0)
     return bool(re.fullmatch(r"\d+(?:\.\d{1,2})?", s))
+
 
 def _to_money(s: str) -> Optional[float]:
     try:
@@ -684,80 +702,128 @@ def extract_items_from_overlay(
     allowed_categories: List[str],
 ) -> List["ParsedExpenseItem"]:
     """
-    Extrae gastos por fila usando coords:
-    - amount = número más a la derecha de la fila
-    - date = token fecha si aparece en la fila; si no, hereda la última vista
-    - description = palabras a la izquierda del amount, recortada a max 4 palabras
+    Extrae gastos por posición:
+    - detecta amount por fila (número más a la derecha)
+    - description: primero intenta izquierda en la MISMA fila;
+      si no hay, busca en filas superiores cercanas (como tu UI de "Revisar antes de guardar")
+    - date: detecta en la fila (o en filas superiores) y hereda si no hay
     """
     words = _extract_words_from_ocrspace_overlay(ocr_json)
     rows = _group_words_by_rows(words, y_tol=14)
 
+    if not rows:
+        return []
+
+    # palabras “basura” típicas de labels del formulario
+    BAD_TOKENS = {
+        "fecha", "descripción", "descripcion", "monto", "categoría", "categoria",
+        "extra", "opcional", "(opcional)"
+    }
+
+    def _is_useful_word(t: str) -> bool:
+        tt = (t or "").strip().lower()
+        if not tt:
+            return False
+        if tt in ("/", "-", "€"):
+            return False
+        # quita labels del formulario
+        if tt in BAD_TOKENS:
+            return False
+        return True
+
+    def _row_text_clean(row_words: list[dict], used_idx: set[int] = set()) -> str:
+        parts = []
+        for i, w in enumerate(row_words):
+            if i in used_idx:
+                continue
+            if not _is_useful_word(w["text"]):
+                continue
+            parts.append(w["text"].strip())
+        return _clean_spaces(" ".join(parts))
+
+    def _title_max4(s: str) -> Tuple[str, str]:
+        s = _clean_spaces(s)
+        if not s:
+            return "Gasto", ""
+        parts = s.split()
+        if len(parts) <= 4:
+            return s[:120], ""
+        return " ".join(parts[:4])[:120], " ".join(parts[4:])[:120]
+
     items: List[ParsedExpenseItem] = []
     current_date_iso: Optional[str] = None
 
+    # precomputa “text limpio” por fila y fecha por fila
+    row_meta = []
     for row in rows:
+        d_iso, used_idx = _row_find_date_indices(row)
+        row_meta.append({"date": d_iso, "used_idx": used_idx})
+
+    for r_idx, row in enumerate(rows):
         texts = [w["text"] for w in row]
 
-        # detecta fecha en la fila (aunque venga partida)
-        d_iso, used_idx = _row_find_date_indices(row)
+        # actualiza fecha heredada si aparece en esta fila
+        d_iso = row_meta[r_idx]["date"]
         if d_iso:
             current_date_iso = d_iso
 
-
-        # detecta importes (candidatos)
+        # detecta importes en esta fila
         money_words = []
         for w in row:
             if _is_money_str(w["text"]):
                 val = _to_money(w["text"])
                 if val is not None and val > 0:
-                    money_words.append((w, val))
+                    money_words.append((w, float(val)))
 
         if not money_words:
             continue
 
-        # coge el importe más a la derecha (x mayor)
+        # importe más a la derecha
         money_words.sort(key=lambda t: t[0]["left"])
         amount_word, amount_val = money_words[-1]
 
-        left_words_all = [w for w in row if w["left"] + w["width"] <= amount_word["left"] - 8]
+        # ---- 1) intenta description en la misma fila (a la izquierda del amount)
+        left_same_row = [w for w in row if (w["left"] + w["width"]) <= (amount_word["left"] - 8)]
+        same_row_desc = _row_text_clean(left_same_row, used_idx=row_meta[r_idx]["used_idx"])
 
-        # elimina tokens de fecha (índices used_idx) y separadores sueltos "/"
-        left_words = []
-        for idx, w in enumerate(row):
-            if w not in left_words_all:
-                continue
-            if idx in used_idx:
-                continue
-            if w["text"].strip() in ("/", "-"):
-                continue
-            left_words.append(w)
+        # quita cosas típicas tipo "Monto" si se colaron
+        if same_row_desc.lower() in BAD_TOKENS or len(same_row_desc) < 2:
+            same_row_desc = ""
 
-        left_text = " ".join(w["text"] for w in left_words).strip()
-        left_text = _clean_spaces(left_text)
+        # ---- 2) si no hay, busca EN FILAS DE ARRIBA cercanas (tu caso actual)
+        best_desc = same_row_desc
+        best_date = d_iso
 
-        # description SIEMPRE sale de lo de la izquierda (sin fecha)
-        desc = left_text or "Gasto"
+        if not best_desc:
+            # ventana vertical: mira hasta 6 filas arriba (ajústalo si quieres)
+            for up in range(1, 7):
+                j = r_idx - up
+                if j < 0:
+                    break
 
-        # regla: max 4 palabras en description; el resto al extra (si quieres)
-        extra = ""
-        parts = desc.split()
-        if len(parts) > 4:
-            extra = " ".join(parts[4:])[:120]
-            desc = " ".join(parts[:4])
+                # fila superior completa (pero limpia labels)
+                cand = _row_text_clean(rows[j], used_idx=row_meta[j]["used_idx"])
 
-        desc = desc[:120]
+                # evitamos coger líneas que sean claramente el propio importe u otra cosa sin letras
+                if not cand:
+                    continue
+                if re.fullmatch(r"\d+(?:[.,]\d{1,2})?\s*€?", cand.replace(",", ".")):
+                    continue
 
+                # preferimos líneas con letras (merchant/descripción)
+                if not re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", cand):
+                    continue
 
-        if not desc:
-            desc = "Gasto"
+                best_desc = cand
+                # si arriba hay una fecha, úsala también
+                if row_meta[j]["date"]:
+                    best_date = row_meta[j]["date"]
+                    current_date_iso = best_date
+                break
 
-        # regla: máx 4 palabras para description
-        words_desc = desc.split()
-        if len(words_desc) > 4:
-            desc = " ".join(words_desc[:4])
-            extra = " ".join(words_desc[4:])[:120]
+        desc, extra = _title_max4(best_desc)
 
-        date_iso = current_date_iso or _today_iso_midnight()
+        date_iso = best_date or current_date_iso or _today_iso_midnight()
 
         # categoría: si en la fila aparece alguna categoría exacta, úsala; si no, default
         row_join = " ".join(texts).lower()
@@ -772,13 +838,12 @@ def extract_items_from_overlay(
                 amount=float(amount_val),
                 category=cat[:64],
                 extra=extra[:120],
-                confidence=0.80,
+                confidence=0.82,
             )
         )
-    print("ROW ->", [w["text"] for w in row])
-    print("DATE ->", date_iso, "DESC ->", desc, "AMOUNT ->", amount_val)
 
     return items
+
 
 def _looks_like_table(text: str) -> bool:
     # si hay muchas fechas dd/mm/aaaa -> tabla
@@ -963,6 +1028,8 @@ def _normalize_ocr_text_for_tables(s: str) -> str:
     # salto de línea antes de fechas (para separar filas pegadas)
     s = re.sub(r"(?<!\n)\s*(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b)", r"\n\1", s)
     return s.strip()
+
+
 
 
 
@@ -1780,5 +1847,3 @@ def root():
 @app.head("/")
 def root_head():
     return Response(status_code=200)
-
-

@@ -89,6 +89,9 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# Groq (prod barato)
+GROQ_API_KEY = os.getenv("REMOVED_GROQ_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
 
 # =========================
 # CONFIG
@@ -448,35 +451,40 @@ def _limit_description(desc: str, extra: str) -> Tuple[str, str]:
 
 def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
     """
-    PRE-PARSER determinista:
-    - Busca filas tipo tabla: [fecha] ... [importe] ...
-    - Genera candidatos: date_iso + amount + tail_text (para IA)
+    PRE-PARSER robusto:
+    - Convierte el OCR en líneas “procesables”
+    - Si una línea contiene varias fechas (tabla pegada), la parte en trozos
+    - Detecta el último número como importe
+    - Hereda fecha para líneas siguientes sin fecha
     """
-    lines = [ln.strip() for ln in (ocr_text or "").splitlines() if ln.strip()]
-    if not lines:
+    raw_lines = [ln.strip() for ln in (ocr_text or "").splitlines() if ln.strip()]
+    if not raw_lines:
         return []
 
+    # 1) Normaliza y “explota” líneas que traen varias fechas dentro
+    lines: List[str] = []
+    date_re = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
+
+    for ln in raw_lines:
+        ln = _clean_spaces(ln)
+        hits = list(date_re.finditer(ln))
+        if len(hits) <= 1:
+            lines.append(ln)
+        else:
+            # corta antes de cada fecha (excepto la primera)
+            for i, m in enumerate(hits):
+                start = m.start()
+                end = hits[i + 1].start() if i + 1 < len(hits) else len(ln)
+                chunk = ln[start:end].strip()
+                if chunk:
+                    lines.append(chunk)
+
+    # 2) parseo a candidatos
     candidates: List[dict] = []
     current_date_iso: Optional[str] = None
     pending_parts: List[str] = []
 
     for ln in lines:
-        ln = _clean_spaces(ln)
-
-        # A veces OCR pega varias filas en una línea: si hay varias fechas dentro, “explota”
-        # separando antes de cada fecha (excepto la primera).
-        # Ej: "02/02/2026 Fibra ... 03/02/2026 Metro ..."
-        date_positions = [m.start() for m in re.finditer(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", ln)]
-        if len(date_positions) >= 2:
-            chunks = []
-            for idx, pos in enumerate(date_positions):
-                end = date_positions[idx + 1] if idx + 1 < len(date_positions) else len(ln)
-                chunks.append(ln[pos:end].strip())
-            # procesamos cada chunk como si fuera una línea
-            for ch in chunks:
-                lines.insert(lines.index(ln) + 1, ch)
-            continue
-
         tokens = ln.split(" ")
 
         # fecha al inicio
@@ -486,7 +494,7 @@ def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
                 current_date_iso = d_iso
             tokens = tokens[1:]
 
-        # busca último importe
+        # busca último token numérico como importe
         amount_idx = None
         amount_val = None
         for idx in range(len(tokens) - 1, -1, -1):
@@ -497,7 +505,8 @@ def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
                     amount_val = float(v)
                     break
 
-        if amount_idx is None or amount_val is None:
+        # si no hay importe -> es continuación
+        if amount_idx is None:
             if tokens:
                 pending_parts.append(" ".join(tokens))
             continue
@@ -505,21 +514,15 @@ def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
         before_amount = tokens[:amount_idx]
         after_amount = tokens[amount_idx + 1 :]
 
-        # texto “bruto” del candidato: (pendiente + before + after)
         raw = _clean_spaces(" ".join([*pending_parts, " ".join(before_amount), " ".join(after_amount)]))
         pending_parts = []
 
         date_iso = current_date_iso or _today_iso_midnight()
 
-        candidates.append(
-            {
-                "date": date_iso,
-                "amount": float(amount_val),
-                "raw": raw,
-            }
-        )
+        candidates.append({"date": date_iso, "amount": amount_val, "raw": raw})
 
     return candidates
+
 
 
 async def ai_refine_candidates(
@@ -533,8 +536,9 @@ async def ai_refine_candidates(
     if not candidates:
         return []
 
-    if AI_PROVIDER not in ("ollama", "openai"):
+    if AI_PROVIDER not in ("ollama", "openai", "groq"):
         return []
+
 
     # Prompt muy explícito para que NO mezcle filas
     system = (
@@ -734,6 +738,75 @@ async def ai_refine_candidates(
 
         if len(out) < max(1, int(0.7 * len(candidates))):
             return []
+        return out
+
+        # --- GROQ (OpenAI-compatible) ---
+    if AI_PROVIDER == "groq":
+        if not GROQ_API_KEY:
+            raise HTTPException(status_code=500, detail="GROQ_API_KEY no configurada")
+
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        payload = {
+            "model": GROQ_MODEL,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+            ],
+            "response_format": {"type": "json_object"},
+        }
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(url, headers=headers, json=payload)
+
+        if r.status_code != 200:
+            return []
+
+        data = r.json()
+        content = data["choices"][0]["message"]["content"]
+
+        try:
+            obj = json.loads(content)
+        except Exception:
+            return []
+
+        items = obj.get("items", [])
+        out: List[ParsedExpenseItem] = []
+
+        for i, it in enumerate(items):
+            base = candidates[i] if i < len(candidates) else None
+            if not base:
+                continue
+
+            date_iso = base["date"]
+            amount = float(base["amount"])
+
+            cat = (it.get("category") or "").strip()
+            if cat not in allowed_categories:
+                cat2 = _pick_category_from_text(base.get("raw", ""), allowed_categories)
+                cat = cat2 or (allowed_categories[0] if allowed_categories else "Desayuno/Fuera")
+
+            desc = (it.get("description") or "").strip() or "Gasto"
+            extra = (it.get("extra") or "").strip()
+
+            desc, extra = _limit_description(desc, extra)
+
+            out.append(
+                ParsedExpenseItem(
+                    date=date_iso,
+                    description=desc[:120],
+                    amount=amount,
+                    category=cat[:64],
+                    extra=extra[:120],
+                    confidence=float(it.get("confidence") or 0.8),
+                )
+            )
+
+        # si devuelve muy pocos items, consideramos fallo y hacemos fallback
+        if len(out) < max(1, int(0.7 * len(candidates))):
+            return []
+
         return out
 
     return []

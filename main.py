@@ -1422,6 +1422,146 @@ def _ext_from_filename(name: str) -> str:
         return "webp"
     return ""
 
+def _extract_lines_from_ocrspace_overlay(ocr_json: dict) -> List[dict]:
+    """
+    Devuelve líneas con bbox aproximado:
+    {text,left,top,right,bottom}
+    """
+    out = []
+    try:
+        pr = (ocr_json.get("ParsedResults") or [])[0] or {}
+        overlay = pr.get("TextOverlay") or {}
+        lines = overlay.get("Lines") or []
+        for ln in lines:
+            words = ln.get("Words") or []
+            if not words:
+                continue
+            xs, ys, rs, bs = [], [], [], []
+            parts = []
+            for w in words:
+                t = (w.get("WordText") or "").strip()
+                if t:
+                    parts.append(t)
+                L = int(w.get("Left") or 0)
+                T = int(w.get("Top") or 0)
+                W = int(w.get("Width") or 0)
+                H = int(w.get("Height") or 0)
+                xs.append(L); ys.append(T); rs.append(L + W); bs.append(T + H)
+            text = _clean_spaces(" ".join(parts))
+            if not text:
+                continue
+            out.append({
+                "text": text,
+                "left": min(xs),
+                "top": min(ys),
+                "right": max(rs),
+                "bottom": max(bs),
+            })
+    except Exception:
+        return []
+    return out
+
+
+def _looks_like_ing_cards(text_out: str, ocr_json: dict) -> bool:
+    """
+    Heurística fuerte: muchas veces "ING" + varios importes con € + fechas relativas tipo "ayer/lun/sáb"
+    """
+    t = (text_out or "").lower()
+    ing_count = len(re.findall(r"\bing\b", t))
+    euros = len(re.findall(r"\b\d+[.,]\d{2}\s*€\b", t))
+    has_rel = any(k in t for k in ["ayer", "hoy", "lun", "mar", "mié", "mie", "jue", "vie", "sáb", "sab", "dom"])
+    lines = _extract_lines_from_ocrspace_overlay(ocr_json)
+    return (len(lines) >= 8) and (ing_count >= 2) and (euros >= 2) and has_rel
+
+
+def _rel_to_date_iso(rel_label: str) -> str:
+    """
+    Convierte "ayer, 17:46" / "lun, 20:06" a YYYY-MM-DDT00:00:00 usando hora local Madrid.
+    """
+    now = datetime.now(ZoneInfo("Europe/Madrid"))
+    dt = _parse_relative_day(rel_label, now)  # tu función ya existente
+    return f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}T00:00:00"
+
+
+def explode_candidates_from_ing_cards(ocr_json: dict) -> List[dict]:
+    """
+    Crea candidates del estilo:
+      {"date": "...T00:00:00", "amount": 9.90, "raw": "El Callejon Madrid", "rel": "ayer, 17:46"}
+    """
+    lines = _extract_lines_from_ocrspace_overlay(ocr_json)
+    if not lines:
+        return []
+
+    lines_sorted = sorted(lines, key=lambda x: (x["top"], x["left"]))
+
+    # líneas que parecen fecha relativa (suelen estar arriba-derecha)
+    rel_lines = []
+    for ln in lines_sorted:
+        tx = (ln["text"] or "").lower().strip()
+        if any(tx.startswith(k) for k in ["hoy", "ayer", "lun", "mar", "mié", "mie", "jue", "vie", "sáb", "sab", "dom"]):
+            rel_lines.append(ln)
+
+    # líneas con importe "9,90 €"
+    amount_lines = []
+    for ln in lines_sorted:
+        if re.search(r"\b\d+[.,]\d{2}\s*€\b", ln["text"] or ""):
+            amount_lines.append(ln)
+
+    candidates = []
+    for a in amount_lines:
+        ay = a["top"]
+        ax = a["left"]
+
+        # importe numérico
+        m = re.search(r"(\d+[.,]\d{2})\s*€", a["text"])
+        if not m:
+            continue
+        amount = float(m.group(1).replace(",", "."))
+
+        # merchant/desc: mejor línea encima (cerca) que NO sea solo "ING"
+        best_desc = ""
+        best_score = None
+        for ln in lines_sorted:
+            if ln["top"] >= ay:
+                continue
+            txt = (ln["text"] or "").strip()
+            if not txt:
+                continue
+            if txt.upper() == "ING":
+                continue
+            dy = ay - ln["top"]
+            if dy > 260:
+                continue
+            dx = abs((ln["left"] or 0) - ax)
+            score = dy * 1.0 + dx * 0.15
+            if best_score is None or score < best_score:
+                best_score = score
+                best_desc = txt
+
+        # fecha relativa: línea más cercana en vertical y claramente a la derecha
+        best_rel = ""
+        best_dy = None
+        for rl in rel_lines:
+            dy = abs(rl["top"] - ay)
+            if dy > 260:
+                continue
+            if rl["left"] < 250:   # derecha
+                continue
+            if best_dy is None or dy < best_dy:
+                best_dy = dy
+                best_rel = (rl["text"] or "").strip()
+
+        date_iso = _rel_to_date_iso(best_rel) if best_rel else _today_iso_midnight()
+        raw = _clean_spaces(best_desc)
+
+        candidates.append({
+            "date": date_iso,
+            "amount": float(amount),
+            "raw": raw if raw else "Gasto",
+            "rel": best_rel,
+        })
+
+    return candidates
 
 # =========================
 # APP
@@ -1749,80 +1889,64 @@ async def parse_image(
         data,
     )
 
-    # OCR (texto + JSON completo con overlay)
     text_out, ocr_json = await ocr_via_ocrspace(mem)
 
-    if not (text_out or "").strip() and not ocr_json:
+    # si ParsedText viene flojo pero hay overlay, reconstruye
+    if not (text_out or "").strip():
+        text_out = _rebuild_text_from_overlay(ocr_json)
+
+    if not (text_out or "").strip():
         return {"items": []}
 
     allowed = get_allowed_categories(user, db)
 
-    # -------------------------
-    # Helpers internos (solo aquí)
-    # -------------------------
-    def _looks_like_table(txt: str) -> bool:
-        # muchas fechas dd/mm/yyyy suele ser tabla
-        dates = re.findall(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", txt or "")
-        if len(dates) >= 5:
-            return True
-        starts = sum(
-            1
-            for ln in (txt or "").splitlines()
-            if re.match(r"^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", ln)
-        )
-        return starts >= 3
+    # =========================================================
+    # (1) MODO CARDS (ING/Apple Pay)
+    # =========================================================
+    if _looks_like_ing_cards(text_out, ocr_json):
+        candidates = explode_candidates_from_ing_cards(ocr_json)
 
-    def _overlay_lines_count(j: dict) -> int:
+        # IA para description/category (sin tocar date/amount)
         try:
-            pr = (j or {}).get("ParsedResults", []) or []
-            if not pr:
-                return 0
-            overlay = (pr[0].get("TextOverlay") or {})
-            return len(overlay.get("Lines", []) or [])
-        except Exception:
-            return 0
-
-    def _looks_like_cards(txt: str, j: dict) -> bool:
-        # heurística para ApplePay/ING: muchos importes con € + palabras tipo "ayer", "lun", "sáb"
-        t = (txt or "").lower()
-        euros = len(re.findall(r"\b\d+[.,]\d{2}\s*€\b", t))
-        has_rel = any(k in t for k in ["ayer", "hoy", "lun", "mar", "mié", "mie", "jue", "vie", "sáb", "sab", "dom"])
-        has_overlay = _overlay_lines_count(j) > 0
-        return has_overlay and euros >= 2 and has_rel
-
-    # -------------------------
-    # 0) Si parece "cards" y tenemos overlay, intenta modo tarjetas
-    #    (tu función extract_items_from_overlay se encarga de asociar por posición)
-    # -------------------------
-    try:
-        if _looks_like_cards(text_out, ocr_json):
-            overlay_items = extract_items_from_overlay(ocr_json, allowed)
-            if overlay_items:
-                # ✅ devuelve ya items bien asociados
-                return {"items": overlay_items}
-    except Exception:
-        # si algo falla con overlay, seguimos al modo tabla/fallback
-        pass
-
-    # -------------------------
-    # 1) Modo tabla (o fallback general)
-    # -------------------------
-    if not (text_out or "").strip():
-        return {"items": []}
-
-    # 1a) pre-parser -> candidatos (tabla)
-    candidates = explode_candidates_from_ocr(text_out)
-
-    # Si NO salen candidatos, como último intento, prueba overlay igual (por si era tabla rara)
-    if not candidates:
-        try:
-            overlay_items = extract_items_from_overlay(ocr_json, allowed)
-            if overlay_items:
-                return {"items": overlay_items}
+            ai_items = await ai_refine_candidates(candidates, allowed)
+            if ai_items:
+                return {"items": ai_items}
         except Exception:
             pass
 
-    # 1b) IA refina candidatos (description/extra/categoría) sin tocar date/amount
+        # fallback sin IA: usa raw corto y categoría default
+        out = []
+        for c in candidates:
+            desc, extra = _limit_description(c.get("raw") or "Gasto", c.get("rel") or "")
+            out.append(ParsedExpenseItem(
+                date=c["date"],
+                description=desc[:120],
+                amount=float(c["amount"]),
+                category=(allowed[0] if allowed else DEFAULT_CATEGORIES[0]),
+                extra=extra[:120],
+                confidence=0.60,
+            ))
+        if out:
+            return {"items": out}
+
+        # si falla todo, seguimos a tabla/fallback
+        # (no return)
+
+    # =========================================================
+    # (2) MODO TABLA (por filas)
+    # =========================================================
+    try:
+        overlay_items = extract_items_from_overlay(ocr_json, allowed)
+        if overlay_items:
+            return {"items": overlay_items}
+    except Exception:
+        pass
+
+    # normaliza texto y pre-parser
+    norm_text = _normalize_ocr_text_for_tables(text_out)
+    candidates = explode_candidates_from_ocr(norm_text)
+
+    # IA refina
     try:
         ai_items = await ai_refine_candidates(candidates, allowed)
         if ai_items:
@@ -1830,14 +1954,9 @@ async def parse_image(
     except Exception:
         pass
 
-    # 1c) fallback determinista
-    items = parse_text_fallback(text_out, allowed)
-    print("OCR len:", len(text_out or ""))
-    print("OCR first:", (text_out or "")[:200])
-
+    # fallback determinista
+    items = parse_text_fallback(norm_text, allowed)
     return {"items": items}
-
-
 
 @app.get("/")
 def root():

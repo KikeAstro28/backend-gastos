@@ -2,7 +2,7 @@ import os
 import re
 import json
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import unquote
 
 import httpx
@@ -31,262 +31,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 # =========================
 OCR_PROVIDER = os.getenv("OCR_PROVIDER", "none").lower()
 OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
-OCR_LANG = os.getenv("OCR_LANG", "spa")  # OCR.space usa: spa, eng, etc.
-
-
-# =========================
-# AI (estructurar OCR -> items)
-#   - AI_PROVIDER = "ollama" (local)  o  "openai" (cloud)  o  "none"
-# =========================
-AI_PROVIDER = os.getenv("AI_PROVIDER", "none").lower()
-
-# OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-# Ollama (local)
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
-
-
-def _extract_json_block(s: str) -> str:
-    """
-    Intenta recuperar el primer bloque JSON (objeto o array) del texto.
-    """
-    s = (s or "").strip()
-    if s.startswith("{") or s.startswith("["):
-        return s
-
-    start_obj = s.find("{")
-    start_arr = s.find("[")
-    starts = [x for x in (start_obj, start_arr) if x != -1]
-    if not starts:
-        return ""
-    start = min(starts)
-    return s[start:]
-
-
-async def ai_parse_items_from_text(raw_text: str, allowed_categories: List[str]) -> List["ParsedExpenseItem"]:
-    """
-    Convierte texto OCR (sucio) en items estructurados usando IA.
-    Devuelve lista ParsedExpenseItem con date ISO "YYYY-MM-DDT00:00:00".
-
-    - Si AI_PROVIDER == "ollama": usa /api/chat en OLLAMA_BASE_URL
-    - Si AI_PROVIDER == "openai": usa Responses API (Structured Output)
-    - Si AI_PROVIDER == "none": devuelve []
-    """
-    raw_text = (raw_text or "").strip()
-    if not raw_text:
-        return []
-
-    if AI_PROVIDER == "ollama":
-        system = (
-            "Eres un asistente que convierte texto OCR de gastos en items estructurados.\n"
-            "Devuelve SOLO JSON válido (sin markdown).\n"
-            "Formato exacto:\n"
-            "{ \"items\": ["
-            "{\"date\":\"YYYY-MM-DDT00:00:00\",\"description\":\"...\",\"amount\":12.34,"
-            "\"category\":\"...\",\"extra\":\"...\",\"confidence\":0.0}"
-            "] }\n"
-            "Reglas:\n"
-            "- Separa cada gasto en un item distinto.\n"
-            "- NO juntes varias descripciones en un solo item.\n"
-            "- date: si viene dd/mm/yyyy conviértelo a YYYY-MM-DDT00:00:00.\n"
-            "- Si falta fecha, usa la fecha de HOY con T00:00:00.\n"
-            "- amount: siempre número con punto decimal.\n"
-            "- category: debe ser EXACTAMENTE una de las categorías permitidas.\n"
-            "- extra: puede ser \"\".\n"
-        )
-
-        user_prompt = (
-            "Categorías permitidas:\n"
-            + "\n".join(f"- {c}" for c in allowed_categories)
-            + "\n\nTexto OCR:\n"
-            + raw_text
-        )
-
-        payload = {
-            "model": OLLAMA_MODEL,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_prompt},
-            ],
-            "stream": False,
-            "options": {"temperature": 0.1},
-        }
-
-        url = f"{OLLAMA_BASE_URL}/api/chat"
-        try:
-            async with httpx.AsyncClient(timeout=120) as client:
-                r = await client.post(url, json=payload)
-        except Exception:
-            return []
-
-        if r.status_code != 200:
-            return []
-
-        data = r.json()
-        content = (((data or {}).get("message") or {}).get("content") or "").strip()
-        raw_json = _extract_json_block(content)
-        if not raw_json:
-            return []
-
-        try:
-            obj = json.loads(raw_json)
-        except Exception:
-            return []
-
-        items = obj.get("items", [])
-        out: List[ParsedExpenseItem] = []
-
-        for it in items:
-            try:
-                date = (it.get("date") or "").strip() or _today_iso_midnight()
-                desc = (it.get("description") or "Gasto").strip()
-                amount = float(it.get("amount"))
-                cat = (it.get("category") or allowed_categories[0]).strip()
-                if cat not in allowed_categories:
-                    cat = allowed_categories[0]
-                extra = (it.get("extra") or "").strip()
-                conf = float(it.get("confidence") or 0.7)
-
-                out.append(
-                    ParsedExpenseItem(
-                        date=date,
-                        description=desc[:120],
-                        amount=abs(amount),
-                        category=cat[:64],
-                        extra=extra[:120],
-                        confidence=max(0.0, min(conf, 1.0)),
-                    )
-                )
-            except Exception:
-                continue
-
-        # filtra basura
-        out = [p for p in out if p.amount > 0 and p.date]
-        return out
-
-    if AI_PROVIDER == "openai":
-        if not OPENAI_API_KEY:
-            raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
-
-        # JSON Schema estricto (Structured Outputs)
-        schema = {
-            "name": "parsed_expenses",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "date": {"type": "string"},        # "YYYY-MM-DDT00:00:00"
-                                "description": {"type": "string"},
-                                "amount": {"type": "number"},
-                                "category": {"type": "string"},
-                                "extra": {"type": "string"},
-                                "confidence": {"type": "number"},
-                            },
-                            "required": ["date", "description", "amount", "category", "extra", "confidence"],
-                        },
-                    }
-                },
-                "required": ["items"],
-            },
-        }
-
-        system = (
-            "Eres un extractor de gastos. A partir de texto OCR (posiblemente desordenado), "
-            "devuelve SOLO JSON válido que cumpla el esquema. "
-            "Reglas:\n"
-            "- date SIEMPRE en formato ISO: YYYY-MM-DDT00:00:00\n"
-            "- amount en euros (float)\n"
-            "- category debe ser UNA de las categorías permitidas\n"
-            "- extra puede ser '' si no hay\n"
-            "- Separa cada gasto en un item distinto.\n"
-            "- No inventes importes.\n"
-            "- Si hay filas tipo Excel (fecha | descripción | importe | categoría | extra), respétalas.\n"
-        )
-
-        user = (
-            "CATEGORÍAS PERMITIDAS:\n"
-            + "\n".join(f"- {c}" for c in allowed_categories)
-            + "\n\n"
-            "TEXTO OCR:\n"
-            + raw_text
-        )
-
-        payload = {
-            "model": OPENAI_MODEL,
-            "input": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": schema,
-            },
-        }
-
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
-
-        if r.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"OpenAI error {r.status_code}: {r.text}")
-
-        data = r.json()
-
-        # Responses API: intenta localizar el texto JSON
-        text_json = None
-        try:
-            text_json = data.get("output_text")
-            if not text_json:
-                out = data.get("output", [])
-                for msg in out:
-                    for c in msg.get("content", []):
-                        if c.get("type") in ("output_text", "text"):
-                            text_json = c.get("text")
-                            break
-                    if text_json:
-                        break
-        except Exception:
-            text_json = None
-
-        if not text_json:
-            return []
-
-        try:
-            obj = json.loads(text_json)
-            items = obj.get("items", [])
-            parsed: List[ParsedExpenseItem] = []
-            for it in items:
-                parsed.append(
-                    ParsedExpenseItem(
-                        date=(it.get("date") or "").strip() or _today_iso_midnight(),
-                        description=(it.get("description") or "").strip()[:120] or "Gasto",
-                        amount=float(it.get("amount") or 0),
-                        category=(it.get("category") or allowed_categories[0])[:64],
-                        extra=(it.get("extra") or "")[:120],
-                        confidence=float(it.get("confidence") or 0.6),
-                    )
-                )
-            parsed = [p for p in parsed if p.amount > 0 and p.date]
-            return parsed
-        except Exception:
-            return []
-
-    # AI_PROVIDER == "none" o desconocido
-    return []
+OCR_LANG = os.getenv("OCR_LANG", "spa")  # ocr.space: spa, eng, etc.
 
 
 async def ocr_via_ocrspace(file_like) -> str:
@@ -324,15 +69,25 @@ async def ocr_via_ocrspace(file_like) -> str:
         raise HTTPException(status_code=502, detail=f"OCR.space error {r.status_code}: {r.text}")
 
     j = r.json()
-
-    try:
-        parsed_results = j.get("ParsedResults", [])
-        if not parsed_results:
-            return ""
-        text_out = parsed_results[0].get("ParsedText", "") or ""
-        return text_out.strip()
-    except Exception:
+    parsed_results = j.get("ParsedResults", []) or []
+    if not parsed_results:
         return ""
+    text_out = parsed_results[0].get("ParsedText", "") or ""
+    return text_out.strip()
+
+
+# =========================
+# AI (Ollama / OpenAI)
+# =========================
+AI_PROVIDER = os.getenv("AI_PROVIDER", "none").lower()
+
+# Ollama (local)
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
+
+# OpenAI (prod)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 # =========================
@@ -399,7 +154,6 @@ def ensure_schema():
                     """
                 )
             ).scalar()
-
             if not table_exists:
                 return
 
@@ -640,41 +394,15 @@ def _normalize_date(d: str) -> Optional[str]:
     return None
 
 
-def _pick_category(text: str) -> str:
-    t = (text or "").lower()
-
-    # si viene ya una categoría literal, la respetamos (solo default aquí)
-    for c in DEFAULT_CATEGORIES:
-        if c.lower() in t:
-            return c
-
-    # heurística por keywords
-    if any(k in t for k in ["metro", "uber", "bus", "renfe", "taxi"]):
-        return "Transporte"
-    if any(k in t for k in ["mercadona", "carrefour", "aldi", "lidl", "super", "compra"]):
-        return "Compra/Supermercado"
-    if any(k in t for k in ["cafe", "caf", "bar", "desay", "tost", "menu", "comida", "cena"]):
-        return "Desayuno/Fuera"
-    if any(k in t for k in ["spotify", "netflix", "prime", "chatgpt", "suscrip"]):
-        return "Suscripciones"
-    if any(k in t for k in ["tabaco", "cigar", "vaper"]):
-        return "Tabaco"
-    if any(k in t for k in ["cerve", "vino", "alcohol"]):
-        return "Alcohol/Cervezas"
-
-    return DEFAULT_CATEGORIES[0]
-
-
 def _is_date_token(tok: str) -> bool:
-    return bool(re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", tok.strip()))
+    tok = tok.strip()
+    return bool(re.fullmatch(r"\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?", tok))
 
 
 def _is_amount_token(tok: str) -> bool:
     t = tok.strip().replace("€", "")
-    # evita tokens que parezcan fecha
-    if "/" in t:
+    if "/" in t or "-" in t:
         return False
-    # el '-' puede aparecer en importes negativos, pero también en fechas; como arriba filtramos '/', aquí vale
     return bool(re.fullmatch(r"-?\d+(?:[.,]\d{1,2})?", t))
 
 
@@ -685,120 +413,398 @@ def _parse_amount_token(tok: str) -> Optional[float]:
     except Exception:
         return None
 
-DATE_RE = re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b")
 
-def _explode_rows_by_dates(text: str) -> str:
+def _pick_category_from_text(text: str, allowed: List[str]) -> Optional[str]:
+    t = (text or "").lower()
+    # match exact allowed categories if they appear
+    for c in allowed:
+        if c.lower() in t:
+            return c
+    return None
+
+
+def _clean_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def _limit_description(desc: str, extra: str) -> Tuple[str, str]:
     """
-    Si OCR devuelve todo 'aplastado', intentamos reconstruir filas.
-    Inserta saltos de línea antes de cada fecha dd/mm/yyyy para que cada fila empiece en una línea.
+    Regla: descripción corta. Si sale larguísima, recortamos y pasamos resto a extra.
     """
-    if not text:
-        return ""
-    t = re.sub(r"\s+", " ", text).strip()  # aplanado controlado
+    desc = _clean_spaces(desc)
+    extra = _clean_spaces(extra)
 
-    # Si hay varias fechas, es muy probable que sea tabla
-    dates = DATE_RE.findall(t)
-    if len(dates) >= 2:
-        # salto de línea antes de cada fecha
-        t = DATE_RE.sub(lambda m: "\n" + m.group(0), t).strip()
+    words = desc.split()
+    if len(words) <= 8 and len(desc) <= 60:
+        return desc, extra
 
-    return t
+    head = " ".join(words[:8]).strip()
+    tail = " ".join(words[8:]).strip()
+
+    if tail:
+        extra = _clean_spaces((extra + " " + tail).strip())
+    return head[:80], extra[:160]
 
 
-def parse_text_to_items(text: str) -> List[ParsedExpenseItem]:
-    raw_lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-    if not raw_lines:
+def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
+    """
+    PRE-PARSER determinista:
+    - Busca filas tipo tabla: [fecha] ... [importe] ...
+    - Genera candidatos: date_iso + amount + tail_text (para IA)
+    """
+    lines = [ln.strip() for ln in (ocr_text or "").splitlines() if ln.strip()]
+    if not lines:
         return []
 
-    items: List[ParsedExpenseItem] = []
+    candidates: List[dict] = []
     current_date_iso: Optional[str] = None
+    pending_parts: List[str] = []
 
-    for ln in raw_lines:
-        ln = re.sub(r"\s+", " ", ln).strip()
-        tokens = ln.split(" ")
-        if not tokens:
+    for ln in lines:
+        ln = _clean_spaces(ln)
+
+        # A veces OCR pega varias filas en una línea: si hay varias fechas dentro, “explota”
+        # separando antes de cada fecha (excepto la primera).
+        # Ej: "02/02/2026 Fibra ... 03/02/2026 Metro ..."
+        date_positions = [m.start() for m in re.finditer(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", ln)]
+        if len(date_positions) >= 2:
+            chunks = []
+            for idx, pos in enumerate(date_positions):
+                end = date_positions[idx + 1] if idx + 1 < len(date_positions) else len(ln)
+                chunks.append(ln[pos:end].strip())
+            # procesamos cada chunk como si fuera una línea
+            for ch in chunks:
+                lines.insert(lines.index(ln) + 1, ch)
             continue
 
-        # 1) fecha al principio (si está)
-        if _is_date_token(tokens[0]):
+        tokens = ln.split(" ")
+
+        # fecha al inicio
+        if tokens and _is_date_token(tokens[0]):
             d_iso = _normalize_date(tokens[0])
             if d_iso:
                 current_date_iso = d_iso
             tokens = tokens[1:]
-            ln_rest = " ".join(tokens).strip()
-        else:
-            ln_rest = " ".join(tokens).strip()
 
-        if not ln_rest:
-            continue
-
-        # 2) encuentra importe (buscando de derecha a izquierda)
+        # busca último importe
+        amount_idx = None
         amount_val = None
-        amount_pos = None
-        rest_tokens = ln_rest.split(" ")
-        for idx in range(len(rest_tokens) - 1, -1, -1):
-            if _is_amount_token(rest_tokens[idx]):
-                v = _parse_amount_token(rest_tokens[idx])
-                if v is not None:
-                    amount_val = abs(float(v))
-                    amount_pos = idx
+        for idx in range(len(tokens) - 1, -1, -1):
+            if _is_amount_token(tokens[idx]):
+                v = _parse_amount_token(tokens[idx])
+                if v is not None and v > 0:
+                    amount_idx = idx
+                    amount_val = float(v)
                     break
 
-        if amount_val is None or amount_pos is None:
+        if amount_idx is None or amount_val is None:
+            if tokens:
+                pending_parts.append(" ".join(tokens))
             continue
 
-        before_amount = rest_tokens[:amount_pos]
-        after_amount = rest_tokens[amount_pos + 1:]
+        before_amount = tokens[:amount_idx]
+        after_amount = tokens[amount_idx + 1 :]
 
-        # 3) categoría: intenta encontrar una categoría EXACTA en after_amount o en toda la línea
-        cat = None
-        lower_line = (" ".join(after_amount) + " " + " ".join(before_amount)).lower()
-        for c in DEFAULT_CATEGORIES:
-            if c.lower() in lower_line:
-                cat = c
-                break
-        if not cat:
-            cat = _pick_category(ln_rest)
-
-        # 4) descripción: lo que va antes del importe, limpiando si contiene la categoría
-        desc = " ".join(before_amount).strip()
-        desc = re.sub(re.escape(cat), "", desc, flags=re.IGNORECASE).strip()
-        if not desc:
-            desc = "Gasto"
-
-        # 5) extra: lo que queda después del importe, quitando categoría si se repite
-        extra = " ".join(after_amount).strip()
-        if extra:
-            extra = re.sub(re.escape(cat), "", extra, flags=re.IGNORECASE).strip(" -:\t")
+        # texto “bruto” del candidato: (pendiente + before + after)
+        raw = _clean_spaces(" ".join([*pending_parts, " ".join(before_amount), " ".join(after_amount)]))
+        pending_parts = []
 
         date_iso = current_date_iso or _today_iso_midnight()
 
-        items.append(
-            ParsedExpenseItem(
-                date=date_iso,
-                description=desc[:120],
-                amount=amount_val,
-                category=cat[:64],
-                extra=extra[:120],
-                confidence=0.70,
-            )
+        candidates.append(
+            {
+                "date": date_iso,
+                "amount": float(amount_val),
+                "raw": raw,
+            }
         )
 
-    return items
+    return candidates
 
+
+async def ai_refine_candidates(
+    candidates: List[dict],
+    allowed_categories: List[str],
+) -> List[ParsedExpenseItem]:
+    """
+    IA SOLO refina description/extra y (si falta) category.
+    Fecha e importe se respetan del pre-parser.
+    """
+    if not candidates:
+        return []
+
+    if AI_PROVIDER not in ("ollama", "openai"):
+        return []
+
+    # Prompt muy explícito para que NO mezcle filas
+    system = (
+        "Eres un asistente que LIMPIA y NORMALIZA gastos ya detectados.\n"
+        "Te doy una lista de CANDIDATOS, cada uno es 1 gasto con date y amount ya fijados.\n"
+        "Tu trabajo:\n"
+        "1) Para cada candidato, devuelve description corta (max 8 palabras, sin fechas ni importes).\n"
+        "2) Devuelve extra breve (opcional) con el resto útil.\n"
+        "3) category debe ser UNA de las permitidas. Si el candidato ya contiene una categoría, úsala.\n"
+        "4) NO juntes varios candidatos en uno. Mantén el mismo número de items.\n"
+        "5) NO inventes importes ni fechas.\n"
+    )
+
+    user = {
+        "allowed_categories": allowed_categories,
+        "candidates": candidates,
+        "output_format": {
+            "items": [
+                {
+                    "date": "YYYY-MM-DDT00:00:00",
+                    "amount": 0.0,
+                    "category": "one-of-allowed",
+                    "description": "max 8 words",
+                    "extra": "optional",
+                    "confidence": 0.0,
+                }
+            ]
+        },
+    }
+
+    # --- OLLAMA ---
+    if AI_PROVIDER == "ollama":
+        url = f"{OLLAMA_BASE_URL}/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+            ],
+            "format": "json",
+            "stream": False,
+            "options": {"temperature": 0.1},
+        }
+
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(url, json=payload)
+
+        if r.status_code != 200:
+            # si Ollama no está accesible (p.ej. en Render), devolvemos vacío para fallback
+            return []
+
+        data = r.json()
+        content = (data.get("message") or {}).get("content") or ""
+        try:
+            obj = json.loads(content)
+        except Exception:
+            return []
+
+        items = obj.get("items", [])
+        out: List[ParsedExpenseItem] = []
+        for i, it in enumerate(items):
+            # Respetar date/amount del candidato sí o sí
+            base = candidates[i] if i < len(candidates) else None
+            if not base:
+                continue
+            date_iso = base["date"]
+            amount = float(base["amount"])
+
+            cat = (it.get("category") or "").strip()
+            if cat not in allowed_categories:
+                # intenta detectar desde raw
+                cat2 = _pick_category_from_text(base.get("raw", ""), allowed_categories)
+                cat = cat2 or (allowed_categories[0] if allowed_categories else "Desayuno/Fuera")
+
+            desc = (it.get("description") or "").strip() or "Gasto"
+            extra = (it.get("extra") or "").strip()
+
+            desc, extra = _limit_description(desc, extra)
+
+            out.append(
+                ParsedExpenseItem(
+                    date=date_iso,
+                    description=desc[:120],
+                    amount=amount,
+                    category=cat[:64],
+                    extra=extra[:120],
+                    confidence=float(it.get("confidence") or 0.75),
+                )
+            )
+        # si devolvió menos items, fallback
+        if len(out) < max(1, int(0.7 * len(candidates))):
+            return []
+        return out
+
+    # --- OPENAI ---
+    if AI_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
+
+        schema = {
+            "name": "parsed_expenses",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "date": {"type": "string"},
+                                "amount": {"type": "number"},
+                                "category": {"type": "string"},
+                                "description": {"type": "string"},
+                                "extra": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["date", "amount", "category", "description", "extra", "confidence"],
+                        },
+                    }
+                },
+                "required": ["items"],
+            },
+        }
+
+        payload = {
+            "model": OPENAI_MODEL,
+            "input": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+            ],
+            "response_format": {"type": "json_schema", "json_schema": schema},
+        }
+
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post("https://api.openai.com/v1/responses", headers=headers, json=payload)
+
+        if r.status_code != 200:
+            return []
+
+        data = r.json()
+
+        # sacar texto json del response
+        text_json = data.get("output_text")
+        if not text_json:
+            outarr = data.get("output", []) or []
+            for msg in outarr:
+                for c in msg.get("content", []) or []:
+                    if c.get("type") in ("output_text", "text"):
+                        text_json = c.get("text")
+                        break
+                if text_json:
+                    break
+
+        if not text_json:
+            return []
+
+        try:
+            obj = json.loads(text_json)
+        except Exception:
+            return []
+
+        items = obj.get("items", [])
+        out: List[ParsedExpenseItem] = []
+
+        for i, it in enumerate(items):
+            base = candidates[i] if i < len(candidates) else None
+            if not base:
+                continue
+            date_iso = base["date"]
+            amount = float(base["amount"])
+
+            cat = (it.get("category") or "").strip()
+            if cat not in allowed_categories:
+                cat2 = _pick_category_from_text(base.get("raw", ""), allowed_categories)
+                cat = cat2 or (allowed_categories[0] if allowed_categories else "Desayuno/Fuera")
+
+            desc = (it.get("description") or "").strip() or "Gasto"
+            extra = (it.get("extra") or "").strip()
+
+            desc, extra = _limit_description(desc, extra)
+
+            out.append(
+                ParsedExpenseItem(
+                    date=date_iso,
+                    description=desc[:120],
+                    amount=amount,
+                    category=cat[:64],
+                    extra=extra[:120],
+                    confidence=float(it.get("confidence") or 0.8),
+                )
+            )
+
+        if len(out) < max(1, int(0.7 * len(candidates))):
+            return []
+        return out
+
+    return []
+
+
+def parse_text_fallback(text: str, allowed: List[str]) -> List[ParsedExpenseItem]:
+    """
+    Fallback sin IA: usa el mismo pre-parser y mete description raw recortada.
+    """
+    cands = explode_candidates_from_ocr(text)
+    out: List[ParsedExpenseItem] = []
+    for c in cands:
+        raw = c.get("raw", "").strip()
+        # intenta detectar categoría si aparece
+        cat = _pick_category_from_text(raw, allowed) or (allowed[0] if allowed else DEFAULT_CATEGORIES[0])
+        # limpia raw quitando categoría si está
+        if cat:
+            raw2 = re.sub(re.escape(cat), "", raw, flags=re.IGNORECASE).strip(" -:\t")
+        else:
+            raw2 = raw
+
+        desc, extra = _limit_description(raw2 or "Gasto", "")
+        out.append(
+            ParsedExpenseItem(
+                date=c["date"],
+                description=desc[:120],
+                amount=float(c["amount"]),
+                category=cat[:64],
+                extra=extra[:120],
+                confidence=0.55,
+            )
+        )
+    return out
+
+
+def get_allowed_categories(user: User, db: Session) -> List[str]:
+    custom_rows = (
+        db.query(Category)
+        .filter(Category.user_id == user.id)
+        .order_by(Category.name.asc())
+        .all()
+    )
+    custom = [r.name for r in custom_rows]
+
+    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
+    hidden = {r.name.strip().lower() for r in hidden_rows}
+
+    allowed = []
+    seen = set()
+    for c in DEFAULT_CATEGORIES + custom:
+        k = (c or "").strip()
+        if not k:
+            continue
+        if k.lower() in hidden:
+            continue
+        if k.lower() in seen:
+            continue
+        seen.add(k.lower())
+        allowed.append(k)
+    return allowed
 
 
 def _detect_image_kind(data: bytes) -> str:
     if not data or len(data) < 12:
         return ""
-
     if data[:3] == b"\xff\xd8\xff":
         return "jpeg"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "png"
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
-
     return ""
 
 
@@ -811,39 +817,6 @@ def _ext_from_filename(name: str) -> str:
     if name.endswith(".webp"):
         return "webp"
     return ""
-
-
-def get_allowed_categories(user: User, db: Session) -> List[str]:
-    """
-    default + custom - hidden (sin duplicados, respetando orden)
-    """
-    custom_rows = (
-        db.query(Category)
-        .filter(Category.user_id == user.id)
-        .order_by(Category.name.asc())
-        .all()
-    )
-    custom = [r.name for r in custom_rows]
-
-    hidden_rows = db.query(HiddenCategory).filter(HiddenCategory.user_id == user.id).all()
-    hidden = {r.name.strip().lower() for r in hidden_rows}
-
-    allowed: List[str] = []
-    seen = set()
-    for c in DEFAULT_CATEGORIES + custom:
-        k = (c or "").strip()
-        if not k:
-            continue
-        lk = k.lower()
-        if lk in hidden:
-            continue
-        if lk in seen:
-            continue
-        seen.add(lk)
-        allowed.append(k)
-
-    # fallback mínimo por si algo raro
-    return allowed or list(DEFAULT_CATEGORIES)
 
 
 # =========================
@@ -1044,12 +1017,7 @@ def add_expenses_bulk(payload: List[ExpenseIn], user: User = Depends(get_current
 
 
 @app.put("/expenses/{expense_id}", response_model=ExpenseOut)
-def update_expense(
-    expense_id: int,
-    payload: ExpenseUpdate,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def update_expense(expense_id: int, payload: ExpenseUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     e = (
         db.query(Expense)
         .filter(Expense.id == expense_id)
@@ -1111,11 +1079,7 @@ def update_email(payload: UpdateEmailRequest, user: User = Depends(get_current_u
 
 
 @app.post("/me/change-password")
-def change_password(
-    payload: ChangePasswordRequest,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
+def change_password(payload: ChangePasswordRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not verify_password(payload.current_password, user.hashed_password):
         raise HTTPException(status_code=400, detail="Current password incorrect")
     user.hashed_password = hash_password(payload.new_password)
@@ -1135,19 +1099,19 @@ async def parse_text(
 ):
     allowed = get_allowed_categories(user, db)
 
-    # 1) IA primero (ollama/openai)
+    # 1) pre-parser -> candidatos
+    candidates = explode_candidates_from_ocr(payload.text)
+
+    # 2) IA refina (si hay)
     try:
-        ai_items = await ai_parse_items_from_text(payload.text, allowed)
+        ai_items = await ai_refine_candidates(candidates, allowed)
         if ai_items:
             return {"items": ai_items}
-    except HTTPException:
-        # si OpenAI no está configurado, etc.
-        pass
     except Exception:
         pass
 
-    # 2) fallback heurístico
-    items = parse_text_to_items(payload.text)
+    # 3) fallback sin IA
+    items = parse_text_fallback(payload.text, allowed)
     return {"items": items}
 
 
@@ -1182,25 +1146,24 @@ async def parse_image(
     )
 
     text_out = await ocr_via_ocrspace(mem)
-    text_out = _explode_rows_by_dates(text_out)
-
     if not text_out.strip():
         return {"items": []}
 
     allowed = get_allowed_categories(user, db)
 
-    # 1) IA primero (ollama/openai)
+    # 1) pre-parser -> candidatos (esto es la CLAVE para que no devuelva 1 solo gasto)
+    candidates = explode_candidates_from_ocr(text_out)
+
+    # 2) IA refina candidatos
     try:
-        ai_items = await ai_parse_items_from_text(text_out, allowed)
+        ai_items = await ai_refine_candidates(candidates, allowed)
         if ai_items:
             return {"items": ai_items}
-    except HTTPException:
-        pass
     except Exception:
         pass
 
-    # 2) fallback heurístico
-    items = parse_text_to_items(text_out)
+    # 3) fallback
+    items = parse_text_fallback(text_out, allowed)
     return {"items": items}
 
 

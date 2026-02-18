@@ -2,6 +2,7 @@ setuptools>=65
 wheel>=0.41
 fastapi
 uvicorn
+httpx
 sqlalchemy
 passlib
 python-jose

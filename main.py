@@ -34,12 +34,9 @@ OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
 OCR_LANG = os.getenv("OCR_LANG", "spa")  # ocr.space: spa, eng, etc.
 
 
-async def ocr_via_ocrspace(file_like) -> str:
+async def ocr_via_ocrspace(file_like) -> tuple[str, dict]:
     """
-    file_like debe tener:
-      - filename
-      - content_type
-      - async read() -> bytes
+    Devuelve (texto_plano, json_completo) para poder usar TextOverlay (coords).
     """
     if not OCRSPACE_API_KEY:
         raise HTTPException(status_code=500, detail="OCRSPACE_API_KEY no configurada")
@@ -50,7 +47,7 @@ async def ocr_via_ocrspace(file_like) -> str:
     data = {
         "apikey": OCRSPACE_API_KEY,
         "language": OCR_LANG,
-        "isOverlayRequired": "false",
+        "isOverlayRequired": "true",   # <-- CLAVE
         "OCREngine": "2",
     }
 
@@ -71,9 +68,10 @@ async def ocr_via_ocrspace(file_like) -> str:
     j = r.json()
     parsed_results = j.get("ParsedResults", []) or []
     if not parsed_results:
-        return ""
-    text_out = parsed_results[0].get("ParsedText", "") or ""
-    return text_out.strip()
+        return "", j
+
+    text_out = (parsed_results[0].get("ParsedText", "") or "").strip()
+    return text_out, j
 
 
 # =========================
@@ -568,6 +566,152 @@ def explode_candidates_from_ocr(ocr_text: str) -> List[dict]:
 
     return candidates
 
+def _is_money_str(s: str) -> bool:
+    s = (s or "").strip().replace("€", "").replace(",", ".")
+    # evita cosas tipo 02/02/2026
+    if "/" in s or "-" in s:
+        return False
+    return bool(re.fullmatch(r"\d+(?:\.\d{1,2})?", s))
+
+def _to_money(s: str) -> Optional[float]:
+    try:
+        return float((s or "").strip().replace("€", "").replace(",", "."))
+    except Exception:
+        return None
+
+def _is_date_str(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", s))
+
+def _extract_words_from_ocrspace_overlay(ocr_json: dict) -> list[dict]:
+    """
+    Devuelve lista de palabras con coords: {text,left,top,width,height}
+    """
+    try:
+        pr = (ocr_json.get("ParsedResults") or [])[0]
+        overlay = pr.get("TextOverlay") or {}
+        lines = overlay.get("Lines") or []
+        out = []
+        for ln in lines:
+            for w in (ln.get("Words") or []):
+                out.append({
+                    "text": (w.get("WordText") or "").strip(),
+                    "left": int(w.get("Left") or 0),
+                    "top": int(w.get("Top") or 0),
+                    "width": int(w.get("Width") or 0),
+                    "height": int(w.get("Height") or 0),
+                })
+        return [x for x in out if x["text"]]
+    except Exception:
+        return []
+
+def _group_words_by_rows(words: list[dict], y_tol: int = 12) -> list[list[dict]]:
+    """
+    Agrupa palabras por filas según 'top' (coordenada y).
+    """
+    if not words:
+        return []
+
+    ws = sorted(words, key=lambda w: (w["top"], w["left"]))
+    rows: list[list[dict]] = []
+    for w in ws:
+        placed = False
+        cy = w["top"]
+        for row in rows:
+            ry = row[0]["top"]
+            if abs(cy - ry) <= y_tol:
+                row.append(w)
+                placed = True
+                break
+        if not placed:
+            rows.append([w])
+
+    # ordena cada fila por x
+    for row in rows:
+        row.sort(key=lambda w: w["left"])
+    return rows
+
+def extract_items_from_overlay(
+    ocr_json: dict,
+    allowed_categories: List[str],
+) -> List["ParsedExpenseItem"]:
+    """
+    Extrae gastos por fila usando coords:
+    - amount = número más a la derecha de la fila
+    - date = token fecha si aparece en la fila; si no, hereda la última vista
+    - description = palabras a la izquierda del amount, recortada a max 4 palabras
+    """
+    words = _extract_words_from_ocrspace_overlay(ocr_json)
+    rows = _group_words_by_rows(words, y_tol=14)
+
+    items: List[ParsedExpenseItem] = []
+    current_date_iso: Optional[str] = None
+
+    for row in rows:
+        texts = [w["text"] for w in row]
+
+        # detecta fecha en la fila
+        date_tok = next((t for t in texts if _is_date_str(t)), None)
+        if date_tok:
+            d_iso = _normalize_date(date_tok)
+            if d_iso:
+                current_date_iso = d_iso
+
+        # detecta importes (candidatos)
+        money_words = []
+        for w in row:
+            if _is_money_str(w["text"]):
+                val = _to_money(w["text"])
+                if val is not None and val > 0:
+                    money_words.append((w, val))
+
+        if not money_words:
+            continue
+
+        # coge el importe más a la derecha (x mayor)
+        money_words.sort(key=lambda t: t[0]["left"])
+        amount_word, amount_val = money_words[-1]
+
+        # descripción = palabras claramente a la izquierda del importe
+        left_words = [w for w in row if w["left"] + w["width"] <= amount_word["left"] - 8]
+        left_text = " ".join(w["text"] for w in left_words).strip()
+
+        # quita fecha de la descripción si se coló
+        left_text = re.sub(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", "", left_text).strip()
+
+        # si no hay nada a la izquierda, intenta “arriba” (fila anterior cercana)
+        desc = left_text
+        extra = ""
+
+        if not desc:
+            desc = "Gasto"
+
+        # regla: máx 4 palabras para description
+        words_desc = desc.split()
+        if len(words_desc) > 4:
+            desc = " ".join(words_desc[:4])
+            extra = " ".join(words_desc[4:])[:120]
+
+        date_iso = current_date_iso or _today_iso_midnight()
+
+        # categoría: si en la fila aparece alguna categoría exacta, úsala; si no, default
+        row_join = " ".join(texts).lower()
+        cat = next((c for c in allowed_categories if c.lower() in row_join), None)
+        if not cat:
+            cat = allowed_categories[0] if allowed_categories else DEFAULT_CATEGORIES[0]
+
+        items.append(
+            ParsedExpenseItem(
+                date=date_iso,
+                description=desc[:120],
+                amount=float(amount_val),
+                category=cat[:64],
+                extra=extra[:120],
+                confidence=0.80,
+            )
+        )
+
+    return items
 
 
 async def ai_refine_candidates(
@@ -1286,11 +1430,16 @@ async def parse_image(
         data,
     )
 
-    text_out = await ocr_via_ocrspace(mem)
+    text_out, ocr_json = await ocr_via_ocrspace(mem)
+
     if not text_out.strip():
         return {"items": []}
 
     allowed = get_allowed_categories(user, db)
+    # ✅ 0) Intento robusto con coordenadas (overlay): asocia desc/fecha al importe por posición
+    overlay_items = extract_items_from_overlay(ocr_json, allowed)
+    if overlay_items:
+        return {"items": overlay_items}
 
     # 1) pre-parser -> candidatos (esto es la CLAVE para que no devuelva 1 solo gasto)
     candidates = explode_candidates_from_ocr(text_out)

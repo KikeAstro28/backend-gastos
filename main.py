@@ -24,7 +24,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
-
+from zoneinfo import ZoneInfo
 
 # =========================
 # OCR (OCR.space)
@@ -34,9 +34,13 @@ OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
 OCR_LANG = os.getenv("OCR_LANG", "spa")  # ocr.space: spa, eng, etc.
 
 
-async def ocr_via_ocrspace(file_like) -> tuple[str, dict]:
+async def ocr_via_ocrspace(file_like) -> dict:
     """
-    Devuelve (texto_plano, json_completo) para poder usar TextOverlay (coords).
+    Devuelve:
+      {
+        "text": "...",
+        "lines": [ {"text": "...", "left":..,"top":..,"width":..,"height":..}, ... ]
+      }
     """
     if not OCRSPACE_API_KEY:
         raise HTTPException(status_code=500, detail="OCRSPACE_API_KEY no configurada")
@@ -47,7 +51,7 @@ async def ocr_via_ocrspace(file_like) -> tuple[str, dict]:
     data = {
         "apikey": OCRSPACE_API_KEY,
         "language": OCR_LANG,
-        "isOverlayRequired": "true",   # <-- CLAVE
+        "isOverlayRequired": "true",  # ✅ CLAVE
         "OCREngine": "2",
     }
 
@@ -68,10 +72,28 @@ async def ocr_via_ocrspace(file_like) -> tuple[str, dict]:
     j = r.json()
     parsed_results = j.get("ParsedResults", []) or []
     if not parsed_results:
-        return "", j
+        return {"text": "", "lines": []}
 
-    text_out = (parsed_results[0].get("ParsedText", "") or "").strip()
-    return text_out, j
+    pr0 = parsed_results[0]
+    text_out = (pr0.get("ParsedText", "") or "").strip()
+
+    lines_out = []
+    overlay = (pr0.get("TextOverlay") or {})
+    for ln in overlay.get("Lines", []) or []:
+        lt = ln.get("LineText", "") or ""
+        if not lt.strip():
+            continue
+        lines_out.append(
+            {
+                "text": lt.strip(),
+                "left": int(ln.get("MinLeft", 0) or 0),
+                "top": int(ln.get("MinTop", 0) or 0),
+                "width": int(ln.get("MaxWidth", 0) or 0),
+                "height": int(ln.get("MaxHeight", 0) or 0),
+            }
+        )
+
+    return {"text": text_out, "lines": lines_out}
 
 
 # =========================
@@ -781,6 +803,158 @@ def extract_items_from_overlay(
     print("DATE ->", date_iso, "DESC ->", desc, "AMOUNT ->", amount_val)
 
     return items
+
+def _looks_like_table(text: str) -> bool:
+    # si hay muchas fechas dd/mm/aaaa -> tabla
+    dates = re.findall(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", text or "")
+    if len(dates) >= 5:
+        return True
+    # si hay muchas líneas que empiezan por fecha
+    starts = sum(1 for ln in (text or "").splitlines() if re.match(r"^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", ln))
+    return starts >= 3
+
+
+def _looks_like_cards(lines: List[dict]) -> bool:
+    # muchas cantidades con € + presencia de "ayer" o días de la semana
+    if not lines:
+        return False
+    all_text = " ".join(l.get("text","") for l in lines).lower()
+    euros = len(re.findall(r"\b\d+[.,]\d{2}\s*€\b", all_text))
+    has_rel = any(k in all_text for k in ["ayer", "lun", "mar", "mié", "mie", "jue", "vie", "sáb", "sab", "dom", "hoy"])
+    return euros >= 2 and has_rel
+
+def _parse_relative_day(label: str, now: datetime) -> datetime:
+    """
+    label ejemplos: "ayer, 17:46", "lun, 20:06", "sáb, 23:36", "hoy, 12:00"
+    Devuelve datetime con fecha correcta (hora la ignoramos; guardamos a medianoche).
+    """
+    t = (label or "").lower().strip()
+
+    if "hoy" in t:
+        return now
+    if "ayer" in t:
+        return now - timedelta(days=1)
+
+    # días (más reciente hacia atrás)
+    # weekday(): lunes=0 ... domingo=6
+    map_days = {
+        "lun": 0,
+        "mar": 1,
+        "mié": 2, "mie": 2,
+        "jue": 3,
+        "vie": 4,
+        "sáb": 5, "sab": 5,
+        "dom": 6,
+    }
+    for k, wd in map_days.items():
+        if t.startswith(k):
+            delta = (now.weekday() - wd) % 7
+            if delta == 0:
+                delta = 7  # si hoy es lunes y pone "lun", casi siempre es el lunes anterior
+            return now - timedelta(days=delta)
+
+    return now
+
+
+def _short_title_from_line(s: str, max_words: int = 4) -> str:
+    s = _clean_spaces(s)
+    # quita cosas típicas
+    s = re.sub(r"\b(ing)\b", "", s, flags=re.IGNORECASE).strip()
+    # corta ubicación después de coma
+    if "," in s:
+        s = s.split(",")[0].strip()
+    # si empieza por números raros tipo "8830-..." se deja pero acorta igual
+    words = s.split()
+    if not words:
+        return "Gasto"
+    return " ".join(words[:max_words])
+
+
+def explode_candidates_from_overlay_cards(lines: List[dict]) -> List[dict]:
+    """
+    Encuentra importes y asocia:
+      - merchant line = la línea más cercana encima
+      - date label = línea a la derecha con "ayer/lun/sáb..."
+    """
+    if not lines:
+        return []
+
+    # orden por y
+    lines_sorted = sorted(lines, key=lambda x: (x.get("top", 0), x.get("left", 0)))
+
+    # detecta líneas de fecha relativa (suelen estar a la derecha)
+    rel_lines = []
+    for ln in lines_sorted:
+        tx = (ln.get("text") or "").lower()
+        if any(tx.startswith(k) for k in ["hoy", "ayer", "lun", "mar", "mié", "mie", "jue", "vie", "sáb", "sab", "dom"]):
+            rel_lines.append(ln)
+
+    # detecta importes
+    amount_lines = []
+    for ln in lines_sorted:
+        tx = ln.get("text") or ""
+        if re.search(r"\b\d+[.,]\d{2}\s*€\b", tx):
+            amount_lines.append(ln)
+
+    candidates = []
+    for a in amount_lines:
+        ay = a["top"]
+        ax = a["left"]
+
+        # merchant = mejor línea encima, cerca en vertical, y no "ING"
+        best = None
+        best_score = None
+        for ln in lines_sorted:
+            if ln["top"] >= ay:
+                continue
+            txt = (ln.get("text") or "").strip()
+            if not txt or txt.upper() == "ING":
+                continue
+            dy = ay - ln["top"]
+            if dy > 220:  # si está muy lejos, no es del mismo bloque
+                continue
+
+            # preferimos líneas centradas/izquierda similares al importe
+            dx = abs((ln["left"] or 0) - ax)
+            score = dy * 1.0 + dx * 0.15
+            if best_score is None or score < best_score:
+                best_score = score
+                best = ln
+
+        merchant_line = (best.get("text") if best else "").strip()
+
+        # fecha relativa: línea más cercana en vertical, normalmente a la derecha (x grande)
+        best_rel = None
+        best_rel_dy = None
+        for rl in rel_lines:
+            dy = abs(rl["top"] - ay)
+            if dy > 220:
+                continue
+            # favorece que esté a la derecha del merchant/importe
+            if rl["left"] < 250:
+                continue
+            if best_rel_dy is None or dy < best_rel_dy:
+                best_rel_dy = dy
+                best_rel = rl
+
+        rel_label = (best_rel.get("text") if best_rel else "").strip()
+
+        # importe numérico
+        m = re.search(r"(\d+[.,]\d{2})\s*€", a.get("text",""))
+        if not m:
+            continue
+        amount = float(m.group(1).replace(",", "."))
+
+        candidates.append(
+            {
+                "amount": amount,
+                "merchant_line": merchant_line,
+                "rel_label": rel_label,
+                "raw": _clean_spaces(" ".join([merchant_line, rel_label])),
+            }
+        )
+
+    return candidates
 
 
 async def ai_refine_candidates(
@@ -1499,21 +1673,80 @@ async def parse_image(
         data,
     )
 
+    # OCR (texto + JSON completo con overlay)
     text_out, ocr_json = await ocr_via_ocrspace(mem)
 
-    if not text_out.strip():
+    if not (text_out or "").strip() and not ocr_json:
         return {"items": []}
 
     allowed = get_allowed_categories(user, db)
-    # ✅ 0) Intento robusto con coordenadas (overlay): asocia desc/fecha al importe por posición
-    overlay_items = extract_items_from_overlay(ocr_json, allowed)
-    if overlay_items:
-        return {"items": overlay_items}
 
-    # 1) pre-parser -> candidatos (esto es la CLAVE para que no devuelva 1 solo gasto)
+    # -------------------------
+    # Helpers internos (solo aquí)
+    # -------------------------
+    def _looks_like_table(txt: str) -> bool:
+        # muchas fechas dd/mm/yyyy suele ser tabla
+        dates = re.findall(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", txt or "")
+        if len(dates) >= 5:
+            return True
+        starts = sum(
+            1
+            for ln in (txt or "").splitlines()
+            if re.match(r"^\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", ln)
+        )
+        return starts >= 3
+
+    def _overlay_lines_count(j: dict) -> int:
+        try:
+            pr = (j or {}).get("ParsedResults", []) or []
+            if not pr:
+                return 0
+            overlay = (pr[0].get("TextOverlay") or {})
+            return len(overlay.get("Lines", []) or [])
+        except Exception:
+            return 0
+
+    def _looks_like_cards(txt: str, j: dict) -> bool:
+        # heurística para ApplePay/ING: muchos importes con € + palabras tipo "ayer", "lun", "sáb"
+        t = (txt or "").lower()
+        euros = len(re.findall(r"\b\d+[.,]\d{2}\s*€\b", t))
+        has_rel = any(k in t for k in ["ayer", "hoy", "lun", "mar", "mié", "mie", "jue", "vie", "sáb", "sab", "dom"])
+        has_overlay = _overlay_lines_count(j) > 0
+        return has_overlay and euros >= 2 and has_rel
+
+    # -------------------------
+    # 0) Si parece "cards" y tenemos overlay, intenta modo tarjetas
+    #    (tu función extract_items_from_overlay se encarga de asociar por posición)
+    # -------------------------
+    try:
+        if _looks_like_cards(text_out, ocr_json):
+            overlay_items = extract_items_from_overlay(ocr_json, allowed)
+            if overlay_items:
+                # ✅ devuelve ya items bien asociados
+                return {"items": overlay_items}
+    except Exception:
+        # si algo falla con overlay, seguimos al modo tabla/fallback
+        pass
+
+    # -------------------------
+    # 1) Modo tabla (o fallback general)
+    # -------------------------
+    if not (text_out or "").strip():
+        return {"items": []}
+
+    # 1a) pre-parser -> candidatos (tabla)
     candidates = explode_candidates_from_ocr(text_out)
 
-    # 2) IA refina candidatos
+    # Si NO salen candidatos, como último intento, prueba overlay igual (por si era tabla rara)
+    if not candidates:
+        try:
+            overlay_items = extract_items_from_overlay(ocr_json, allowed)
+            if overlay_items:
+                return {"items": overlay_items}
+        except Exception:
+            pass
+
+    # 1b) IA refina candidatos (description/extra/categoría) sin tocar date/amount
     try:
         ai_items = await ai_refine_candidates(candidates, allowed)
         if ai_items:
@@ -1521,9 +1754,10 @@ async def parse_image(
     except Exception:
         pass
 
-    # 3) fallback
+    # 1c) fallback determinista
     items = parse_text_fallback(text_out, allowed)
     return {"items": items}
+
 
 
 @app.get("/")

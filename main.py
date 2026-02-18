@@ -965,73 +965,6 @@ def _normalize_ocr_text_for_tables(s: str) -> str:
     return s.strip()
 
 
-@app.post("/parse/image", response_model=ParseResponse)
-async def parse_image(
-    file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    data = await file.read()
-
-    kind = _detect_image_kind(data) or _ext_from_filename(file.filename or "")
-    if kind not in ("jpeg", "png", "webp"):
-        raise HTTPException(status_code=400, detail="Formato no soportado (jpeg/png/webp)")
-
-    if OCR_PROVIDER != "ocrspace":
-        raise HTTPException(status_code=503, detail="OCR no configurado (OCR_PROVIDER!=ocrspace)")
-
-    class _MemUpload:
-        def __init__(self, filename, content_type, content_bytes):
-            self.filename = filename
-            self.content_type = content_type
-            self._b = content_bytes
-
-        async def read(self):
-            return self._b
-
-    mem = _MemUpload(
-        file.filename or f"image.{kind}",
-        file.content_type or "application/octet-stream",
-        data,
-    )
-
-    # ✅ OCR SIEMPRE devuelve (texto, json)
-    text_out, ocr_json = await ocr_via_ocrspace(mem)
-
-    # ✅ Si ParsedText viene vacío pero hay overlay, lo reconstruimos
-    if not (text_out or "").strip():
-        rebuilt = _rebuild_text_from_overlay(ocr_json)
-        text_out = rebuilt
-
-    if not (text_out or "").strip():
-        return {"items": []}
-
-    allowed = get_allowed_categories(user, db)
-
-    # ✅ 0) overlay mode (si tu extract_items_from_overlay existe y funciona)
-    try:
-        overlay_items = extract_items_from_overlay(ocr_json, allowed)
-        if overlay_items:
-            return {"items": overlay_items}
-    except Exception:
-        pass
-
-    # ✅ 1) modo TABLA (normaliza y explota)
-    norm_text = _normalize_ocr_text_for_tables(text_out)
-    candidates = explode_candidates_from_ocr(norm_text)
-
-    # ✅ 2) IA refina (groq/ollama/openai) si procede
-    try:
-        ai_items = await ai_refine_candidates(candidates, allowed)
-        if ai_items:
-            return {"items": ai_items}
-    except Exception:
-        pass
-
-    # ✅ 3) fallback sin IA (pero usando el mismo norm_text)
-    items = parse_text_fallback(norm_text, allowed)
-    return {"items": items}
-
 
 async def ai_refine_candidates(
     candidates: List[dict],
@@ -1847,3 +1780,5 @@ def root():
 @app.head("/")
 def root_head():
     return Response(status_code=200)
+
+

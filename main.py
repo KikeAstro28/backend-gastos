@@ -34,14 +34,7 @@ OCRSPACE_API_KEY = os.getenv("OCRSPACE_API_KEY", "")
 OCR_LANG = os.getenv("OCR_LANG", "spa")  # ocr.space: spa, eng, etc.
 
 
-async def ocr_via_ocrspace(file_like) -> dict:
-    """
-    Devuelve:
-      {
-        "text": "...",
-        "lines": [ {"text": "...", "left":..,"top":..,"width":..,"height":..}, ... ]
-      }
-    """
+async def ocr_via_ocrspace(file_like):
     if not OCRSPACE_API_KEY:
         raise HTTPException(status_code=500, detail="OCRSPACE_API_KEY no configurada")
 
@@ -51,7 +44,7 @@ async def ocr_via_ocrspace(file_like) -> dict:
     data = {
         "apikey": OCRSPACE_API_KEY,
         "language": OCR_LANG,
-        "isOverlayRequired": "true",  # ✅ CLAVE
+        "isOverlayRequired": "true",   # 👈 necesario para coordenadas
         "OCREngine": "2",
     }
 
@@ -70,30 +63,13 @@ async def ocr_via_ocrspace(file_like) -> dict:
         raise HTTPException(status_code=502, detail=f"OCR.space error {r.status_code}: {r.text}")
 
     j = r.json()
+
     parsed_results = j.get("ParsedResults", []) or []
     if not parsed_results:
-        return {"text": "", "lines": []}
+        return "", j
 
-    pr0 = parsed_results[0]
-    text_out = (pr0.get("ParsedText", "") or "").strip()
-
-    lines_out = []
-    overlay = (pr0.get("TextOverlay") or {})
-    for ln in overlay.get("Lines", []) or []:
-        lt = ln.get("LineText", "") or ""
-        if not lt.strip():
-            continue
-        lines_out.append(
-            {
-                "text": lt.strip(),
-                "left": int(ln.get("MinLeft", 0) or 0),
-                "top": int(ln.get("MinTop", 0) or 0),
-                "width": int(ln.get("MaxWidth", 0) or 0),
-                "height": int(ln.get("MaxHeight", 0) or 0),
-            }
-        )
-
-    return {"text": text_out, "lines": lines_out}
+    text_out = (parsed_results[0].get("ParsedText", "") or "").strip()
+    return text_out, j
 
 
 # =========================
@@ -956,6 +932,106 @@ def explode_candidates_from_overlay_cards(lines: List[dict]) -> List[dict]:
 
     return candidates
 
+def _rebuild_text_from_overlay(ocr_json: dict) -> str:
+    """
+    Si OCR.space devuelve ParsedText malo/vacío pero hay overlay,
+    reconstruimos un texto razonable uniendo las líneas.
+    """
+    try:
+        pr = (ocr_json.get("ParsedResults") or [])[0] or {}
+        overlay = pr.get("TextOverlay") or {}
+        lines = overlay.get("Lines") or []
+        out_lines = []
+        for ln in lines:
+            words = ln.get("Words") or []
+            line_text = " ".join((w.get("WordText") or "").strip() for w in words).strip()
+            if line_text:
+                out_lines.append(line_text)
+        return "\n".join(out_lines).strip()
+    except Exception:
+        return ""
+
+
+def _normalize_ocr_text_for_tables(s: str) -> str:
+    """
+    Normaliza texto para que el parser encuentre bien filas:
+    - fuerza salto de línea antes de cada fecha dd/mm/yyyy
+    - limpia tabs y dobles espacios
+    """
+    s = (s or "").replace("\t", " ")
+    s = re.sub(r"\s+", " ", s)
+    # salto de línea antes de fechas (para separar filas pegadas)
+    s = re.sub(r"(?<!\n)\s*(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b)", r"\n\1", s)
+    return s.strip()
+
+
+@app.post("/parse/image", response_model=ParseResponse)
+async def parse_image(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    data = await file.read()
+
+    kind = _detect_image_kind(data) or _ext_from_filename(file.filename or "")
+    if kind not in ("jpeg", "png", "webp"):
+        raise HTTPException(status_code=400, detail="Formato no soportado (jpeg/png/webp)")
+
+    if OCR_PROVIDER != "ocrspace":
+        raise HTTPException(status_code=503, detail="OCR no configurado (OCR_PROVIDER!=ocrspace)")
+
+    class _MemUpload:
+        def __init__(self, filename, content_type, content_bytes):
+            self.filename = filename
+            self.content_type = content_type
+            self._b = content_bytes
+
+        async def read(self):
+            return self._b
+
+    mem = _MemUpload(
+        file.filename or f"image.{kind}",
+        file.content_type or "application/octet-stream",
+        data,
+    )
+
+    # ✅ OCR SIEMPRE devuelve (texto, json)
+    text_out, ocr_json = await ocr_via_ocrspace(mem)
+
+    # ✅ Si ParsedText viene vacío pero hay overlay, lo reconstruimos
+    if not (text_out or "").strip():
+        rebuilt = _rebuild_text_from_overlay(ocr_json)
+        text_out = rebuilt
+
+    if not (text_out or "").strip():
+        return {"items": []}
+
+    allowed = get_allowed_categories(user, db)
+
+    # ✅ 0) overlay mode (si tu extract_items_from_overlay existe y funciona)
+    try:
+        overlay_items = extract_items_from_overlay(ocr_json, allowed)
+        if overlay_items:
+            return {"items": overlay_items}
+    except Exception:
+        pass
+
+    # ✅ 1) modo TABLA (normaliza y explota)
+    norm_text = _normalize_ocr_text_for_tables(text_out)
+    candidates = explode_candidates_from_ocr(norm_text)
+
+    # ✅ 2) IA refina (groq/ollama/openai) si procede
+    try:
+        ai_items = await ai_refine_candidates(candidates, allowed)
+        if ai_items:
+            return {"items": ai_items}
+    except Exception:
+        pass
+
+    # ✅ 3) fallback sin IA (pero usando el mismo norm_text)
+    items = parse_text_fallback(norm_text, allowed)
+    return {"items": items}
+
 
 async def ai_refine_candidates(
     candidates: List[dict],
@@ -1756,6 +1832,9 @@ async def parse_image(
 
     # 1c) fallback determinista
     items = parse_text_fallback(text_out, allowed)
+    print("OCR len:", len(text_out or ""))
+    print("OCR first:", (text_out or "")[:200])
+
     return {"items": items}
 
 

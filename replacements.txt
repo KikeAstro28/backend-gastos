@@ -1,0 +1,1 @@
+regex:gsk_[A-Za-z0-9]{20,}==>REMOVED_GROQ_KEY

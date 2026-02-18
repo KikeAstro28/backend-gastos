@@ -533,6 +533,11 @@ async def ai_refine_candidates(
     IA SOLO refina description/extra y (si falta) category.
     Fecha e importe se respetan del pre-parser.
     """
+    print("===== AI DEBUG =====")
+    print("AI_PROVIDER =", AI_PROVIDER)
+    print("Número de candidatos =", len(candidates))
+    print("=====================")
+
     if not candidates:
         return []
 
@@ -742,6 +747,7 @@ async def ai_refine_candidates(
 
         # --- GROQ (OpenAI-compatible) ---
     if AI_PROVIDER == "groq":
+        print("🔥 Entrando en bloque GROQ")
         if not GROQ_API_KEY:
             raise HTTPException(status_code=500, detail="GROQ_API_KEY no configurada")
 
